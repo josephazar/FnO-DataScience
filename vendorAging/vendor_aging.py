@@ -29,8 +29,9 @@ from sklearn.ensemble import (
     RandomForestClassifier,
     RandomForestRegressor
 )
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.tree import DecisionTreeClassifier, export_text
 from sklearn.neighbors import LocalOutlierFactor
+
 # =====================================================
 # SNAPSHOT-AWARE DATA PREPARATION FUNCTIONS
 # =====================================================
@@ -306,8 +307,9 @@ def vendor_payment_history_analysis(df, snapshot_date_col='Snapshot_Date', vendo
     return result_df
 
 
+
 def detect_time_based_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                              value_cols=None, zscore_threshold=3.0):
+                              value_cols=None, zscore_threshold=5, window_size=12): # This function needs more work
     """
     Detect anomalies in vendor data based on time series patterns.
 
@@ -317,13 +319,26 @@ def detect_time_based_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id
         vendor_id_col (str): Column containing vendor identifier
         value_cols (list): List of columns to check for anomalies
         zscore_threshold (float): Z-score threshold for flagging anomalies
+        window_size (int): Size of the window for local anomaly detection
 
     Returns:
         pandas.DataFrame: DataFrame with time-based anomaly flags
     """
     # Define default value columns if not specified
     if value_cols is None:
-        value_cols = ['Balance Outstanding', 'Aging_Beyond_90', 'Pct_Aging_Beyond_90']
+        value_cols = [
+            'Balance Outstanding', 
+            'Aging_Beyond_90', 
+            'Pct_Aging_Beyond_90',
+            'Future_Aging',
+            'Aging_0_30',
+            'Aging_31_60',
+            'Aging_61_90',
+            'Aging_91_120',
+            'Aging_121_180',
+            'Aging_181_360',
+            'Above_361_Aging'
+        ]
 
     # Ensure we have time-based metrics
     if 'Aging_Beyond_90' not in df.columns:
@@ -334,50 +349,96 @@ def detect_time_based_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id
 
     # Initialize anomaly columns
     for col in value_cols:
-        result_df[f'{col}_Anomaly'] = False
-        result_df[f'{col}_Zscore'] = np.nan
+        if col in result_df.columns:
+            result_df[f'{col}_Anomaly'] = False
+            result_df[f'{col}_Zscore'] = np.nan
 
     result_df['Time_Anomaly'] = False
     result_df['Anomaly_Details'] = ''
 
     # Detect anomalies for each vendor over time
     for vendor_id, group in result_df.groupby(vendor_id_col):
-        if len(group) >= 3:  # Need at least 3 data points for meaningful time series
+        if len(group) >= window_size:  # Need at least window_size data points
             vendor_data = group.sort_values(snapshot_date_col)
-
+            
             for col in value_cols:
                 if col in vendor_data.columns:
-                    # Calculate z-scores for this vendor's time series
+                    # First check: Look for sudden changes between consecutive points
+                    if len(vendor_data) >= 2:
+                        pct_changes = vendor_data[col].pct_change().abs()
+                        # Flag large percentage changes (more than 100%)
+                        large_changes = pct_changes > 1.0
+                        
+                        # Update anomalies based on large changes
+                        for idx, is_change in zip(vendor_data.index[1:], large_changes[1:]):
+                            if is_change:
+                                result_df.loc[idx, f'{col}_Anomaly'] = True
+                                result_df.loc[idx, f'{col}_Zscore'] = pct_changes.loc[idx]
+                    
+                    # Second check: Look for global outliers using z-score
                     mean_val = vendor_data[col].mean()
                     std_val = vendor_data[col].std()
-
+                    
                     if std_val > 0:  # Avoid division by zero
                         zscores = np.abs((vendor_data[col] - mean_val) / std_val)
-
-                        # Flag anomalies
-                        anomalies = zscores > zscore_threshold
-                        result_df.loc[vendor_data.index, f'{col}_Anomaly'] = anomalies
-                        result_df.loc[vendor_data.index, f'{col}_Zscore'] = zscores
+                        
+                        # Flag global anomalies
+                        global_anomalies = zscores > zscore_threshold
+                        result_df.loc[vendor_data.index, f'{col}_Anomaly'] = (
+                            result_df.loc[vendor_data.index, f'{col}_Anomaly'] | global_anomalies
+                        )
+                        
+                        # Update z-scores (only if we haven't set them from pct_change)
+                        for idx in vendor_data.index:
+                            if pd.isna(result_df.loc[idx, f'{col}_Zscore']):
+                                result_df.loc[idx, f'{col}_Zscore'] = zscores.loc[idx]
+                    
+                    # Third check: Look for local anomalies using rolling window
+                    if len(vendor_data) >= window_size:
+                        for i in range(window_size, len(vendor_data)):
+                            window = vendor_data.iloc[i-window_size:i]
+                            current_val = vendor_data.iloc[i][col]
+                            
+                            window_mean = window[col].mean()
+                            window_std = window[col].std()
+                            
+                            if window_std > 0:
+                                local_zscore = abs((current_val - window_mean) / window_std)
+                                current_idx = vendor_data.index[i]
+                                
+                                # Flag if it's a local anomaly and not already flagged
+                                if local_zscore > zscore_threshold and not result_df.loc[current_idx, f'{col}_Anomaly']:
+                                    result_df.loc[current_idx, f'{col}_Anomaly'] = True
+                                    result_df.loc[current_idx, f'{col}_Zscore'] = local_zscore
 
             # Combine anomalies across columns
             for idx, row in vendor_data.iterrows():
-                anomaly_cols = [col for col in value_cols
-                              if f'{col}_Anomaly' in row.index and row[f'{col}_Anomaly']]
-
+                anomaly_cols = []
+                details = []
+                
+                for col in value_cols:
+                    if col in vendor_data.columns:
+                        anomaly_col = f'{col}_Anomaly'
+                        zscore_col = f'{col}_Zscore'
+                        
+                        if anomaly_col in result_df.columns and result_df.loc[idx, anomaly_col]:
+                            anomaly_cols.append(col)
+                            
+                            # Get direction
+                            if vendor_data.index.get_loc(idx) > 0:
+                                prev_idx = vendor_data.index[vendor_data.index.get_loc(idx) - 1]
+                                direction = "increase" if row[col] > vendor_data.loc[prev_idx, col] else "decrease"
+                            else:
+                                direction = "abnormal value"
+                                
+                            z_val = result_df.loc[idx, zscore_col]
+                            details.append(f"Unusual {direction} in {col} (score={z_val:.2f})")
+                
                 if anomaly_cols:
                     result_df.loc[idx, 'Time_Anomaly'] = True
-
-                    # Create detailed description
-                    details = []
-                    for col in anomaly_cols:
-                        direction = "increase" if row[col] > mean_val else "decrease"
-                        z_val = row[f'{col}_Zscore']
-                        details.append(f"Unusual {direction} in {col} (z={z_val:.2f})")
-
                     result_df.loc[idx, 'Anomaly_Details'] = "; ".join(details)
 
     return result_df
-
 
 def detect_trend_shifts(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
                       value_col='Balance Outstanding', min_snapshots=4, window=3):
@@ -474,8 +535,42 @@ def analyze_seasonal_patterns(df, snapshot_date_col='Snapshot_Date', vendor_id_c
 
     # Results container
     seasonal_results = {}
+    
+    # Check if statsmodels is available
+    try:
+        from statsmodels.tsa.seasonal import seasonal_decompose
+        from statsmodels.tsa.stattools import adfuller
+        statsmodels_available = True
+    except ImportError:
+        statsmodels_available = False
+        print("Statsmodels not available, using simplified seasonal analysis")
 
-    # Analyze each vendor with sufficient data
+    # If statsmodels is not available, use simplified approach
+    if not statsmodels_available:
+        for vendor_id, group in result_df.groupby(vendor_id_col):
+            if len(group) >= min_periods // 2:  # Relaxed requirement
+                vendor_data = group.sort_values(snapshot_date_col)
+                
+                # Create a month field for grouping
+                vendor_data['month'] = vendor_data[snapshot_date_col].dt.month
+                
+                # Calculate average by month
+                monthly_avg = vendor_data.groupby('month')[value_col].mean()
+                
+                # Calculate simple seasonal strength (max month - min month) / mean
+                seasonal_strength = (monthly_avg.max() - monthly_avg.min()) / monthly_avg.mean() if monthly_avg.mean() != 0 else 0
+                
+                seasonal_results[vendor_id] = {
+                    'has_seasonality': seasonal_strength > 0.2,  # Arbitrary threshold
+                    'seasonal_strength': seasonal_strength,
+                    'peak_month': monthly_avg.idxmax(),
+                    'trough_month': monthly_avg.idxmin(),
+                    'monthly_averages': monthly_avg.to_dict()
+                }
+        
+        return seasonal_results
+
+    # If statsmodels is available, use the full analysis
     for vendor_id, group in result_df.groupby(vendor_id_col):
         # Need enough data points for seasonal analysis
         if len(group) >= min_periods:
@@ -523,6 +618,79 @@ def analyze_seasonal_patterns(df, snapshot_date_col='Snapshot_Date', vendor_id_c
                 }
 
     return seasonal_results
+
+
+def detect_pattern_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
+                           value_col='Balance Outstanding', window=3, threshold=2.0):
+    """
+    Detect anomalies in time series patterns for each vendor.
+
+    Args:
+        df (pandas.DataFrame): Prepared vendor aging data
+        snapshot_date_col (str): Column containing snapshot date
+        vendor_id_col (str): Column containing vendor identifier
+        value_col (str): Column to analyze for pattern anomalies
+        window (int): Window size for pattern detection
+        threshold (float): Z-score threshold for flagging anomalies
+
+    Returns:
+        pandas.DataFrame: DataFrame with pattern anomaly flags
+    """
+    # Create a copy to avoid modifying the original
+    result_df = df.copy()
+
+    # Initialize anomaly columns
+    result_df['Pattern_Anomaly'] = False
+    result_df['Pattern_Zscore'] = np.nan
+    result_df['Pattern_Change'] = np.nan
+
+    # Process each vendor separately
+    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
+        # Need enough data points for pattern analysis
+        if len(vendor_df) < window + 1:
+            continue
+
+        # Sort by snapshot date
+        vendor_data = vendor_df.sort_values(snapshot_date_col)
+
+        # Calculate rolling statistics
+        values = vendor_data[value_col].values
+
+        # Calculate sequential changes
+        changes = np.diff(values)
+
+        # Calculate rolling pattern changes if we have enough data
+        if len(changes) >= window:
+            pattern_changes = []
+
+            for i in range(len(changes) - window + 1):
+                window_pattern = changes[i:i+window]
+
+                # Calculate pattern change metric
+                # (mean absolute change within the window)
+                pattern_change = np.mean(np.abs(window_pattern))
+                pattern_changes.append(pattern_change)
+
+            # Calculate z-scores of pattern changes
+            pattern_mean = np.mean(pattern_changes)
+            pattern_std = np.std(pattern_changes)
+
+            if pattern_std > 0:  # Avoid division by zero
+                z_scores = np.abs((pattern_changes - pattern_mean) / pattern_std)
+
+                # Flag anomalies
+                anomaly_flags = z_scores > threshold
+
+                # Update the main dataframe
+                # We need to align the indices correctly
+                start_idx = window  # Skip first "window" snapshots since we need diff and rolling window
+                for i, anomaly in enumerate(anomaly_flags):
+                    idx = vendor_data.index[start_idx + i]
+                    result_df.loc[idx, 'Pattern_Anomaly'] = anomaly
+                    result_df.loc[idx, 'Pattern_Zscore'] = z_scores[i]
+                    result_df.loc[idx, 'Pattern_Change'] = pattern_changes[i]
+
+    return result_df
 
 
 # =====================================================
@@ -580,7 +748,6 @@ def create_vendor_cohorts(df, snapshot_date_col='Snapshot_Date', vendor_id_col='
     X_scaled = scaler.fit_transform(X)
 
     # Apply K-means clustering
-    from sklearn.cluster import KMeans
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     cohort_labels = kmeans.fit_predict(X_scaled)
 
@@ -635,7 +802,7 @@ def compare_vendor_to_peers(df, target_vendor_id, snapshot_date_col='Snapshot_Da
         percentile (bool): Whether to return percentile rankings
 
     Returns:
-        pandas.DataFrame: Comparison results
+        pandas.DataFrame or dict: Comparison results
     """
     # Define default metrics if not specified
     if metrics is None:
@@ -939,7 +1106,442 @@ def snapshot_comparison_analysis(df, snapshot_date_col='Snapshot_Date',
 
 
 # =====================================================
-# PRACTICAL ANALYTICS FUNCTIONS FOR DECISION MAKING
+# ANOMALY DETECTION FUNCTIONS
+# =====================================================
+
+def detect_multivariate_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
+                                features=None, contamination=0.05):
+    """
+    Detect multivariate anomalies using Isolation Forest across snapshots.
+
+    Args:
+        df (pandas.DataFrame): Prepared vendor aging data
+        snapshot_date_col (str): Column containing snapshot date
+        vendor_id_col (str): Column containing vendor identifier
+        features (list): List of columns to use for anomaly detection
+        contamination (float): Expected proportion of outliers (0.0 to 0.5)
+
+    Returns:
+        pandas.DataFrame: DataFrame with multivariate anomaly flags
+    """
+    # Define default features if not specified
+    if features is None:
+        features = [
+            'Balance Outstanding', 'Future_Aging', 'Aging_0_30', 'Aging_31_60',
+            'Aging_61_90', 'Aging_91_120', 'Aging_121_180', 'Aging_181_360',
+            'Above_361_Aging'
+        ]
+
+    # Create a copy to avoid modifying the original
+    result_df = df.copy()
+
+    # Initialize anomaly columns
+    result_df['Multivariate_Anomaly'] = False
+    result_df['Anomaly_Score'] = np.nan
+    result_df['Anomaly_Reason'] = ""
+
+    # Process each snapshot separately
+    for snapshot_date, snapshot_df in result_df.groupby(snapshot_date_col):
+        # Need enough data points for meaningful analysis
+        if len(snapshot_df) < 20:
+            continue
+
+        # Prepare features
+        # Make sure to use only columns that exist in the dataframe
+        available_features = [f for f in features if f in snapshot_df.columns]
+        if len(available_features) < 2:
+            print(f"Warning: Not enough features available for snapshot {snapshot_date}")
+            continue
+
+        X = snapshot_df[available_features].fillna(0)
+
+        # Normalize features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # Apply Isolation Forest
+        model = IsolationForest(contamination=contamination, random_state=42)
+        outlier_labels = model.fit_predict(X_scaled)
+
+        # Convert predictions to binary outlier flag (-1 for outliers, 1 for inliers)
+        is_outlier = outlier_labels == -1
+
+        # Calculate anomaly scores
+        anomaly_scores = model.decision_function(X_scaled)
+        normalized_scores = 1 - (anomaly_scores - np.min(anomaly_scores)) / (np.max(anomaly_scores) - np.min(anomaly_scores))
+
+        # Update the dataframe
+        snapshot_indices = snapshot_df.index
+        result_df.loc[snapshot_indices, 'Multivariate_Anomaly'] = is_outlier
+        result_df.loc[snapshot_indices, 'Anomaly_Score'] = normalized_scores
+
+        # For outliers, determine which features contributed most
+        if sum(is_outlier) > 0:
+            # Calculate z-scores for each feature using numpy arrays
+            feature_values = X.values
+            feature_means = np.mean(feature_values, axis=0)
+            feature_stds = np.std(feature_values, axis=0)
+
+            # Replace zero std with 1 to avoid division by zero
+            feature_stds[feature_stds == 0] = 1
+
+            # Calculate z-scores
+            z_scores_array = np.abs((feature_values - feature_means) / feature_stds)
+
+            # Create anomaly reasons
+            anomaly_reasons = []
+            for i, (idx, is_out) in enumerate(zip(snapshot_indices, is_outlier)):
+                if is_out:
+                    # Get top contributing features for this outlier
+                    feature_scores = []
+                    for j, feature in enumerate(available_features):
+                        feature_scores.append((feature, z_scores_array[i, j]))
+
+                    # Sort by z-score and take top 3
+                    feature_scores.sort(key=lambda x: x[1], reverse=True)
+                    top_features = feature_scores[:3]
+
+                    # Create reason string
+                    reason = "; ".join([f"{feature} (z={score:.2f})" for feature, score in top_features])
+                    result_df.loc[idx, 'Anomaly_Reason'] = reason
+                else:
+                    result_df.loc[idx, 'Anomaly_Reason'] = ""
+
+    return result_df
+
+
+def detect_velocity_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
+                            aging_cols=None, threshold=0.3):
+    """
+    Detect anomalies in the velocity of aging movement between buckets.
+
+    Args:
+        df (pandas.DataFrame): Prepared vendor aging data
+        snapshot_date_col (str): Column containing snapshot date
+        vendor_id_col (str): Column containing vendor identifier
+        aging_cols (list): List of aging bucket columns in chronological order
+        threshold (float): Threshold for flagging velocity anomalies
+
+    Returns:
+        pandas.DataFrame: DataFrame with velocity anomaly flags
+    """
+    # Define default aging columns if not specified
+    if aging_cols is None:
+        aging_cols = [
+            'Future_Aging', 'Aging_0_30', 'Aging_31_60', 'Aging_61_90',
+            'Aging_91_120', 'Aging_121_180', 'Aging_181_360', 'Above_361_Aging'
+        ]
+
+    # Create a copy to avoid modifying the original
+    result_df = df.copy()
+
+    # Initialize anomaly columns
+    result_df['Velocity_Anomaly'] = False
+    result_df['Velocity_Anomaly_Score'] = np.nan
+    result_df['Velocity_Anomaly_Reason'] = ""
+
+    # Process each vendor separately
+    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
+        # Need at least two snapshots for velocity analysis
+        if len(vendor_df) < 2:
+            continue
+
+        # Sort by snapshot date
+        vendor_data = vendor_df.sort_values(snapshot_date_col)
+
+        # Calculate aging distribution for each snapshot
+        for i in range(len(vendor_data)):
+            total_aging = sum(vendor_data.iloc[i][aging_cols])
+
+            if total_aging != 0:
+                for col in aging_cols:
+                    vendor_data.loc[vendor_data.index[i], f'{col}_Pct'] = vendor_data.iloc[i][col] / total_aging
+            else:
+                for col in aging_cols:
+                    vendor_data.loc[vendor_data.index[i], f'{col}_Pct'] = 0
+
+        # Calculate velocity of change between snapshots
+        if len(vendor_data) >= 2:
+            for i in range(1, len(vendor_data)):
+                velocity_anomalies = []
+
+                for col in aging_cols:
+                    pct_col = f'{col}_Pct'
+                    prev_pct = vendor_data.iloc[i-1][pct_col]
+                    curr_pct = vendor_data.iloc[i][pct_col]
+
+                    # Calculate velocity of change
+                    velocity = curr_pct - prev_pct
+
+                    # Check if velocity exceeds threshold
+                    if abs(velocity) > threshold:
+                        direction = "increase" if velocity > 0 else "decrease"
+                        velocity_anomalies.append(f"{col} {direction} by {abs(velocity):.1%}")
+
+                if velocity_anomalies:
+                    result_df.loc[vendor_data.index[i], 'Velocity_Anomaly'] = True
+                    result_df.loc[vendor_data.index[i], 'Velocity_Anomaly_Score'] = len(velocity_anomalies) / len(aging_cols)
+                    result_df.loc[vendor_data.index[i], 'Velocity_Anomaly_Reason'] = "; ".join(velocity_anomalies)
+
+    return result_df
+
+
+def detect_cohort_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
+                          group_by_col='country_name', value_col='Aging_Beyond_90',
+                          threshold=2.0):
+    """
+    Detect vendors that are anomalous compared to their cohort (e.g., country).
+
+    Args:
+        df (pandas.DataFrame): Prepared vendor aging data
+        snapshot_date_col (str): Column containing snapshot date
+        vendor_id_col (str): Column containing vendor identifier
+        group_by_col (str): Column defining the cohort (e.g., country, sales person)
+        value_col (str): Column to analyze for anomalies
+        threshold (float): Z-score threshold for flagging anomalies
+
+    Returns:
+        pandas.DataFrame: DataFrame with cohort anomaly flags
+    """
+    # Create a copy to avoid modifying the original
+    result_df = df.copy()
+
+    # Initialize anomaly columns
+    result_df['Cohort_Anomaly'] = False
+    result_df['Cohort_Zscore'] = np.nan
+    result_df['Cohort_Deviation'] = np.nan
+
+    # Process each snapshot separately
+    for snapshot_date, snapshot_df in result_df.groupby(snapshot_date_col):
+        # Process each cohort within the snapshot
+        for group_value, group_df in snapshot_df.groupby(group_by_col):
+            # Need enough data points for meaningful analysis
+            if len(group_df) < 5:
+                continue
+
+            # Calculate cohort statistics
+            cohort_mean = group_df[value_col].mean()
+            cohort_std = group_df[value_col].std()
+
+            if cohort_std > 0:  # Avoid division by zero
+                # Calculate z-scores within cohort
+                z_scores = np.abs((group_df[value_col] - cohort_mean) / cohort_std)
+
+                # Flag anomalies
+                anomaly_flags = z_scores > threshold
+
+                # Update the main dataframe
+                result_df.loc[group_df.index, 'Cohort_Anomaly'] = anomaly_flags
+                result_df.loc[group_df.index, 'Cohort_Zscore'] = z_scores
+                result_df.loc[group_df.index, 'Cohort_Deviation'] = group_df[value_col] - cohort_mean
+
+    return result_df
+
+
+def combine_anomaly_detectors(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID'):
+    """
+    Combine multiple anomaly detection methods for a comprehensive view.
+
+    Args:
+        df (pandas.DataFrame): Prepared vendor aging data
+        snapshot_date_col (str): Column containing snapshot date
+        vendor_id_col (str): Column containing vendor identifier
+
+    Returns:
+        pandas.DataFrame: DataFrame with combined anomaly results
+    """
+    # Create a copy to avoid modifying the original
+    result_df = df.copy()
+
+    # Apply each anomaly detection method
+    print("Detecting multivariate anomalies...")
+    multivariate_df = detect_multivariate_anomalies(result_df)
+
+    print("Detecting velocity anomalies...")
+    velocity_df = detect_velocity_anomalies(result_df)
+
+    print("Detecting cohort anomalies...")
+    cohort_df = detect_cohort_anomalies(result_df)
+
+    # Combine results into a single dataframe
+    result_df['Multivariate_Anomaly'] = multivariate_df['Multivariate_Anomaly']
+    result_df['Multivariate_Score'] = multivariate_df['Anomaly_Score']
+    result_df['Multivariate_Reason'] = multivariate_df['Anomaly_Reason'] if 'Anomaly_Reason' in multivariate_df.columns else ""
+
+    result_df['Velocity_Anomaly'] = velocity_df['Velocity_Anomaly']
+    result_df['Velocity_Score'] = velocity_df['Velocity_Anomaly_Score']
+    result_df['Velocity_Reason'] = velocity_df['Velocity_Anomaly_Reason']
+
+    result_df['Cohort_Anomaly'] = cohort_df['Cohort_Anomaly']
+    result_df['Cohort_Score'] = cohort_df['Cohort_Zscore']
+
+    # Create a combined anomaly flag and score
+    result_df['Any_Anomaly'] = (
+        result_df['Multivariate_Anomaly'] |
+        result_df['Velocity_Anomaly'] |
+        result_df['Cohort_Anomaly']
+    )
+
+    # Create a combined anomaly score (average of available scores)
+    score_columns = [col for col in ['Multivariate_Score', 'Velocity_Score', 'Cohort_Score']
+                    if col in result_df.columns]
+
+    if score_columns:
+        result_df['Combined_Anomaly_Score'] = result_df[score_columns].mean(axis=1)
+    else:
+        result_df['Combined_Anomaly_Score'] = np.nan
+
+    # Create a comprehensive anomaly reason
+    anomaly_reasons = []
+    for idx, row in result_df.iterrows():
+        reasons = []
+
+        if row.get('Multivariate_Anomaly') and 'Multivariate_Reason' in row and row['Multivariate_Reason']:
+            reasons.append(f"Multivariate: {row['Multivariate_Reason']}")
+
+        if row.get('Velocity_Anomaly') and 'Velocity_Reason' in row and row['Velocity_Reason']:
+            reasons.append(f"Velocity: {row['Velocity_Reason']}")
+
+        if row.get('Cohort_Anomaly'):
+            if 'Cohort_Deviation' in row:
+                direction = "higher" if row['Cohort_Deviation'] > 0 else "lower"
+                reasons.append(f"Differs from cohort: {direction} than peers")
+            else:
+                reasons.append("Differs from cohort")
+
+        anomaly_reasons.append("; ".join(reasons))
+
+    result_df['Anomaly_Details'] = anomaly_reasons
+
+    return result_df
+
+
+def segment_vendors_by_anomaly_patterns(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
+                                     n_clusters=4):
+    """
+    Segment vendors based on their anomaly patterns over time.
+
+    Args:
+        df (pandas.DataFrame): Dataframe with anomaly detection results
+        snapshot_date_col (str): Column containing snapshot date
+        vendor_id_col (str): Column containing vendor identifier
+        n_clusters (int): Number of clusters to create
+
+    Returns:
+        tuple: (DataFrame with anomaly pattern segments, cluster profiles)
+    """
+    # Create a copy to avoid modifying the original
+    result_df = df.copy()
+
+    # Calculate anomaly frequency for each vendor across snapshots
+    vendor_anomaly_stats = []
+
+    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
+        # Count snapshots with different types of anomalies
+        total_snapshots = len(vendor_df)
+
+        if total_snapshots == 0:
+            continue
+
+        multivariate_count = sum(vendor_df.get('Multivariate_Anomaly', 0))
+        velocity_count = sum(vendor_df.get('Velocity_Anomaly', 0))
+        cohort_count = sum(vendor_df.get('Cohort_Anomaly', 0))
+        any_count = sum(vendor_df.get('Any_Anomaly', 0))
+
+        # Calculate frequencies
+        vendor_stats = {
+            'Vendor_ID': vendor_id,
+            'Total_Snapshots': total_snapshots,
+            'Multivariate_Frequency': multivariate_count / total_snapshots,
+            'Velocity_Frequency': velocity_count / total_snapshots,
+            'Cohort_Frequency': cohort_count / total_snapshots,
+            'Any_Anomaly_Frequency': any_count / total_snapshots,
+            'Max_Anomaly_Score': vendor_df.get('Combined_Anomaly_Score', 0).max() if 'Combined_Anomaly_Score' in vendor_df.columns else 0
+        }
+
+        vendor_anomaly_stats.append(vendor_stats)
+
+# Create dataframe with vendor anomaly statistics
+    anomaly_stats_df = pd.DataFrame(vendor_anomaly_stats)
+
+    # Apply clustering to segment vendors
+    if len(anomaly_stats_df) >= n_clusters:
+        # Features for clustering
+        features = [
+            'Multivariate_Frequency', 'Velocity_Frequency',
+            'Cohort_Frequency', 'Any_Anomaly_Frequency', 'Max_Anomaly_Score'
+        ]
+
+        # Prepare feature matrix
+        X = anomaly_stats_df[features].fillna(0)
+
+        # Normalize features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # Apply K-means clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        clusters = kmeans.fit_predict(X_scaled)
+
+        # Add cluster assignments
+        anomaly_stats_df['Anomaly_Cluster'] = clusters
+
+        # Create descriptive labels
+        cluster_profiles = {}
+        for i in range(n_clusters):
+            cluster_data = anomaly_stats_df[anomaly_stats_df['Anomaly_Cluster'] == i]
+
+            # Determine key characteristics
+            avg_frequency = cluster_data['Any_Anomaly_Frequency'].mean()
+            max_score = cluster_data['Max_Anomaly_Score'].mean()
+
+            # Primary anomaly type
+            anomaly_types = ['Multivariate', 'Velocity', 'Cohort']
+            type_frequencies = [
+                cluster_data[f'{t}_Frequency'].mean() for t in anomaly_types
+            ]
+            primary_type = anomaly_types[np.argmax(type_frequencies)]
+
+            # Create label
+            if avg_frequency > 0.7:
+                frequency_label = "Frequent"
+            elif avg_frequency > 0.3:
+                frequency_label = "Occasional"
+            else:
+                frequency_label = "Rare"
+
+            if max_score > 0.7:
+                severity_label = "Severe"
+            elif max_score > 0.4:
+                severity_label = "Moderate"
+            else:
+                severity_label = "Minor"
+
+            label = f"Cluster {i+1}: {frequency_label} {severity_label} Anomalies ({primary_type})"
+
+            cluster_profiles[i] = {
+                'label': label,
+                'size': len(cluster_data),
+                'avg_frequency': avg_frequency,
+                'avg_max_score': max_score,
+                'primary_type': primary_type
+            }
+
+        # Map clusters back to the main dataframe
+        vendor_cluster_map = anomaly_stats_df[['Vendor_ID', 'Anomaly_Cluster']].set_index('Vendor_ID')
+
+        # Add cluster and label to each snapshot
+        result_df['Anomaly_Cluster'] = result_df[vendor_id_col].map(vendor_cluster_map['Anomaly_Cluster'])
+        result_df['Anomaly_Cluster_Label'] = result_df['Anomaly_Cluster'].map({i: profile['label'] for i, profile in cluster_profiles.items()})
+
+        return result_df, cluster_profiles
+    else:
+        # Not enough vendors for clustering
+        return result_df, {}
+
+
+# =====================================================
+# DECISION SUPPORT FUNCTIONS
 # =====================================================
 
 def calculate_collection_priority_score(df, snapshot_date_col='Snapshot_Date',
@@ -1083,8 +1685,6 @@ def identify_root_causes(df, snapshot_date_col='Snapshot_Date',
     y = latest_df['Has_Aging_Issues']
 
     # Apply decision tree for root cause analysis
-    from sklearn.tree import DecisionTreeClassifier, export_text
-
     tree = DecisionTreeClassifier(max_depth=4, min_samples_leaf=max(5, min_samples // 20))
     tree.fit(X, y)
 
@@ -1154,1497 +1754,532 @@ def get_factor_description(df, factor, aging_col):
     return f"{base_desc} is associated with differing aging patterns"
 
 
-def detect_multivariate_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                                features=None, contamination=0.05):
+def create_action_recommendations(df, priority_threshold=75):
     """
-    Detect multivariate anomalies using Isolation Forest across snapshots.
-
+    Create tailored action recommendations based on vendor priority and characteristics.
+    
     Args:
-        df (pandas.DataFrame): Prepared vendor aging data
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-        features (list): List of columns to use for anomaly detection
-        contamination (float): Expected proportion of outliers (0.0 to 0.5)
-
+        df (pandas.DataFrame): Dataframe with collection priority scores
+        priority_threshold (float): Threshold for high priority vendors
+        
     Returns:
-        pandas.DataFrame: DataFrame with multivariate anomaly flags
+        pandas.DataFrame: Dataframe with recommended actions
     """
-    # Define default features if not specified
-    if features is None:
-        features = [
-            'Balance Outstanding', 'Future_Aging', 'Aging_0_30', 'Aging_31_60',
-            'Aging_61_90', 'Aging_91_120', 'Aging_121_180', 'Aging_181_360',
-            'Above_361_Aging'
-        ]
-
-    # Create a copy to avoid modifying the original
+    # Create a copy to work with
     result_df = df.copy()
-
-    # Initialize anomaly columns
-    result_df['Multivariate_Anomaly'] = False
-    result_df['Anomaly_Score'] = np.nan
-    result_df['Anomaly_Reason'] = ""
-
-    # Process each snapshot separately
-    for snapshot_date, snapshot_df in result_df.groupby(snapshot_date_col):
-        # Need enough data points for meaningful analysis
-        if len(snapshot_df) < 20:
-            continue
-
-        # Prepare features
-        # Make sure to use only columns that exist in the dataframe
-        available_features = [f for f in features if f in snapshot_df.columns]
-        if len(available_features) < 2:
-            print(f"Warning: Not enough features available for snapshot {snapshot_date}")
-            continue
-
-        X = snapshot_df[available_features].fillna(0)
-
-        # Normalize features
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-
-        # Apply Isolation Forest
-        model = IsolationForest(contamination=contamination, random_state=42)
-        outlier_labels = model.fit_predict(X_scaled)
-
-        # Convert predictions to binary outlier flag (-1 for outliers, 1 for inliers)
-        is_outlier = outlier_labels == -1
-
-        # Calculate anomaly scores
-        anomaly_scores = model.decision_function(X_scaled)
-        normalized_scores = 1 - (anomaly_scores - np.min(anomaly_scores)) / (np.max(anomaly_scores) - np.min(anomaly_scores))
-
-        # Update the dataframe
-        snapshot_indices = snapshot_df.index
-        result_df.loc[snapshot_indices, 'Multivariate_Anomaly'] = is_outlier
-        result_df.loc[snapshot_indices, 'Anomaly_Score'] = normalized_scores
-
-        # For outliers, determine which features contributed most
-        if sum(is_outlier) > 0:
-            # Calculate z-scores for each feature using numpy arrays
-            feature_values = X.values
-            feature_means = np.mean(feature_values, axis=0)
-            feature_stds = np.std(feature_values, axis=0)
-
-            # Replace zero std with 1 to avoid division by zero
-            feature_stds[feature_stds == 0] = 1
-
-            # Calculate z-scores
-            z_scores_array = np.abs((feature_values - feature_means) / feature_stds)
-
-            # Create anomaly reasons
-            anomaly_reasons = []
-            for i, (idx, is_out) in enumerate(zip(snapshot_indices, is_outlier)):
-                if is_out:
-                    # Get top contributing features for this outlier
-                    feature_scores = []
-                    for j, feature in enumerate(available_features):
-                        feature_scores.append((feature, z_scores_array[i, j]))
-
-                    # Sort by z-score and take top 3
-                    feature_scores.sort(key=lambda x: x[1], reverse=True)
-                    top_features = feature_scores[:3]
-
-                    # Create reason string
-                    reason = "; ".join([f"{feature} (z={score:.2f})" for feature, score in top_features])
-                    result_df.loc[idx, 'Anomaly_Reason'] = reason
-                else:
-                    result_df.loc[idx, 'Anomaly_Reason'] = ""
-
-    return result_df
-
-def detect_pattern_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                           value_col='Balance Outstanding', window=3, threshold=2.0):
-    """
-    Detect anomalies in time series patterns for each vendor.
-
-    Args:
-        df (pandas.DataFrame): Prepared vendor aging data
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-        value_col (str): Column to analyze for pattern anomalies
-        window (int): Window size for pattern detection
-        threshold (float): Z-score threshold for flagging anomalies
-
-    Returns:
-        pandas.DataFrame: DataFrame with pattern anomaly flags
-    """
-    # Create a copy to avoid modifying the original
-    result_df = df.copy()
-
-    # Initialize anomaly columns
-    result_df['Pattern_Anomaly'] = False
-    result_df['Pattern_Zscore'] = np.nan
-    result_df['Pattern_Change'] = np.nan
-
-    # Process each vendor separately
-    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
-        # Need enough data points for pattern analysis
-        if len(vendor_df) < window + 1:
-            continue
-
-        # Sort by snapshot date
-        vendor_data = vendor_df.sort_values(snapshot_date_col)
-
-        # Calculate rolling statistics
-        values = vendor_data[value_col].values
-
-        # Calculate sequential changes
-        changes = np.diff(values)
-
-        # Calculate rolling pattern changes if we have enough data
-        if len(changes) >= window:
-            pattern_changes = []
-
-            for i in range(len(changes) - window + 1):
-                window_pattern = changes[i:i+window]
-
-                # Calculate pattern change metric
-                # (mean absolute change within the window)
-                pattern_change = np.mean(np.abs(window_pattern))
-                pattern_changes.append(pattern_change)
-
-            # Calculate z-scores of pattern changes
-            pattern_mean = np.mean(pattern_changes)
-            pattern_std = np.std(pattern_changes)
-
-            if pattern_std > 0:  # Avoid division by zero
-                z_scores = np.abs((pattern_changes - pattern_mean) / pattern_std)
-
-                # Flag anomalies
-                anomaly_flags = z_scores > threshold
-
-                # Update the main dataframe
-                # We need to align the indices correctly
-                start_idx = window  # Skip first "window" snapshots since we need diff and rolling window
-                for i, anomaly in enumerate(anomaly_flags):
-                    idx = vendor_data.index[start_idx + i]
-                    result_df.loc[idx, 'Pattern_Anomaly'] = anomaly
-                    result_df.loc[idx, 'Pattern_Zscore'] = z_scores[i]
-                    result_df.loc[idx, 'Pattern_Change'] = pattern_changes[i]
-
+    
+    # Initialize recommendation columns
+    result_df['Recommended_Action'] = ""
+    result_df['Action_Urgency'] = ""
+    result_df['Follow_Up_Frequency'] = ""
+    result_df['Specific_Instructions'] = ""
+    
+    # High priority vendors (critical)
+    high_priority = result_df['Collection_Priority_Score'] >= priority_threshold
+    result_df.loc[high_priority, 'Action_Urgency'] = "Immediate"
+    result_df.loc[high_priority, 'Follow_Up_Frequency'] = "Weekly"
+    
+    # Determine specific actions based on aging and days since payment
+    
+    # 1. Long overdue with high aging ratio
+    long_overdue_high_aging = (
+        (result_df['Days_Since_Payment'] > 90) & 
+        (result_df['Aging_Ratio'] > 0.5) &
+        high_priority
+    )
+    result_df.loc[long_overdue_high_aging, 'Recommended_Action'] = "Escalate to management"
+    result_df.loc[long_overdue_high_aging, 'Specific_Instructions'] = (
+        "Contact senior management; consider credit hold; "
+        "request payment plan or security; involve legal if no response"
+    )
+    
+    # 2. High aging but recent payment
+    high_aging_recent_payment = (
+        (result_df['Days_Since_Payment'] <= 90) & 
+        (result_df['Aging_Ratio'] > 0.5) &
+        high_priority
+    )
+    result_df.loc[high_aging_recent_payment, 'Recommended_Action'] = "Structured payment plan"
+    result_df.loc[high_aging_recent_payment, 'Specific_Instructions'] = (
+        "Acknowledge recent payment; request commitment on payment plan for remaining balance; "
+        "consider partial credit hold until aging ratio improves"
+    )
+    
+    # 3. Medium priority vendors
+    medium_priority = (
+        (result_df['Collection_Priority_Score'] >= 50) & 
+        (result_df['Collection_Priority_Score'] < priority_threshold)
+    )
+    result_df.loc[medium_priority, 'Action_Urgency'] = "This week"
+    result_df.loc[medium_priority, 'Follow_Up_Frequency'] = "Bi-weekly"
+    result_df.loc[medium_priority, 'Recommended_Action'] = "Proactive contact"
+    result_df.loc[medium_priority, 'Specific_Instructions'] = (
+        "Review account status with customer; send aging statement; "
+        "identify any invoice disputes; request payment timeline"
+    )
+    
+    # 4. Low priority vendors
+    low_priority = result_df['Collection_Priority_Score'] < 50
+    result_df.loc[low_priority, 'Action_Urgency'] = "Routine"
+    result_df.loc[low_priority, 'Follow_Up_Frequency'] = "Monthly"
+    result_df.loc[low_priority, 'Recommended_Action'] = "Monitor"
+    result_df.loc[low_priority, 'Specific_Instructions'] = (
+        "Regular account review; send automated statements; "
+        "watch for changes in payment patterns"
+    )
+    
     return result_df
 
 
-def detect_velocity_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                            aging_cols=None, threshold=0.3):
-    """
-    Detect anomalies in the velocity of aging movement between buckets.
+# =====================================================
+# COMPREHENSIVE ANALYSIS CLASS
+# =====================================================
 
-    Args:
-        df (pandas.DataFrame): Prepared vendor aging data
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-        aging_cols (list): List of aging bucket columns in chronological order
-        threshold (float): Threshold for flagging velocity anomalies
-
-    Returns:
-        pandas.DataFrame: DataFrame with velocity anomaly flags
+class VendorAgingAnalytics:
     """
-    # Define default aging columns if not specified
-    if aging_cols is None:
+    A comprehensive analytics engine for vendor aging data that handles multiple snapshots
+    and provides descriptive, diagnostic, and prescriptive insights.
+    """
+    
+    def __init__(self, output_dir='vendor_aging_report'):
+        """
+        Initialize the analytics engine.
+        
+        Args:
+            output_dir (str): Directory to save analysis outputs and visualizations
+        """
+        self.output_dir = output_dir
+        self.df = None
+        self.prepared_df = None
+        self.metrics_df = None
+        self.trends_df = None
+        self.payment_df = None
+        self.anomalies_df = None
+        self.cohort_df = None
+        self.cohort_profiles = None
+        self.priority_df = None
+        self.recommendations_df = None
+        self.today = datetime.now().strftime('%Y-%m-%d')
+        
+        # Create output directory if it doesn't exist
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    def load_data(self, file_path):
+        """
+        Load vendor aging data from a CSV file.
+        
+        Args:
+            file_path (str): Path to the vendor aging CSV file
+            
+        Returns:
+            self: For method chaining
+        """
+        self.df = pd.read_csv(file_path)
+        return self
+    
+    def prepare_data(self):
+        """
+        Prepare the data for analysis by applying the data preparation functions.
+        
+        Returns:
+            self: For method chaining
+        """
+        print("Preparing data for analysis...")
+        self.prepared_df = prepare_time_series_data(self.df)
+        self.metrics_df = calculate_aging_metrics_over_time(self.prepared_df)
+        self.trends_df = calculate_aging_trends(self.metrics_df)
+        self.payment_df = vendor_payment_history_analysis(self.trends_df)
+        return self
+    
+    def run_descriptive_analytics(self):
+        """
+        Generate descriptive analytics about the current state of aging.
+        
+        Returns:
+            dict: Descriptive analytics results
+        """
+        print("Generating descriptive analytics...")
+        
+        # Ensure data is prepared
+        if self.payment_df is None:
+            self.prepare_data()
+        
+        # Get the latest snapshot date for current metrics
+        latest_date = self.payment_df['Snapshot_Date'].max()
+        latest_data = self.payment_df[self.payment_df['Snapshot_Date'] == latest_date]
+        
+        # Calculate overall aging metrics
+        total_balance = latest_data['Balance Outstanding'].sum()
+        total_aging_beyond_90 = latest_data['Aging_Beyond_90'].sum()
+        avg_pct_aging_beyond_90 = latest_data['Pct_Aging_Beyond_90'].mean()
+        
+        # Calculate distribution by aging bucket
         aging_cols = [
             'Future_Aging', 'Aging_0_30', 'Aging_31_60', 'Aging_61_90',
             'Aging_91_120', 'Aging_121_180', 'Aging_181_360', 'Above_361_Aging'
         ]
-
-    # Create a copy to avoid modifying the original
-    result_df = df.copy()
-
-    # Initialize anomaly columns
-    result_df['Velocity_Anomaly'] = False
-    result_df['Velocity_Anomaly_Score'] = np.nan
-    result_df['Velocity_Anomaly_Reason'] = ""
-
-    # Process each vendor separately
-    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
-        # Need at least two snapshots for velocity analysis
-        if len(vendor_df) < 2:
-            continue
-
-        # Sort by snapshot date
-        vendor_data = vendor_df.sort_values(snapshot_date_col)
-
-        # Calculate aging distribution for each snapshot
-        for i in range(len(vendor_data)):
-            total_aging = sum(vendor_data.iloc[i][aging_cols])
-
-            if total_aging != 0:
-                for col in aging_cols:
-                    vendor_data.loc[vendor_data.index[i], f'{col}_Pct'] = vendor_data.iloc[i][col] / total_aging
-            else:
-                for col in aging_cols:
-                    vendor_data.loc[vendor_data.index[i], f'{col}_Pct'] = 0
-
-        # Calculate velocity of change between snapshots
-        if len(vendor_data) >= 2:
-            for i in range(1, len(vendor_data)):
-                velocity_anomalies = []
-
-                for col in aging_cols:
-                    pct_col = f'{col}_Pct'
-                    prev_pct = vendor_data.iloc[i-1][pct_col]
-                    curr_pct = vendor_data.iloc[i][pct_col]
-
-                    # Calculate velocity of change
-                    velocity = curr_pct - prev_pct
-
-                    # Check if velocity exceeds threshold
-                    if abs(velocity) > threshold:
-                        direction = "increase" if velocity > 0 else "decrease"
-                        velocity_anomalies.append(f"{col} {direction} by {abs(velocity):.1%}")
-
-                if velocity_anomalies:
-                    result_df.loc[vendor_data.index[i], 'Velocity_Anomaly'] = True
-                    result_df.loc[vendor_data.index[i], 'Velocity_Anomaly_Score'] = len(velocity_anomalies) / len(aging_cols)
-                    result_df.loc[vendor_data.index[i], 'Velocity_Anomaly_Reason'] = "; ".join(velocity_anomalies)
-
-    return result_df
-
-
-def detect_cohort_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                          group_by_col='country_name', value_col='Aging_Beyond_90',
-                          threshold=2.0):
-    """
-    Detect vendors that are anomalous compared to their cohort (e.g., country).
-
-    Args:
-        df (pandas.DataFrame): Prepared vendor aging data
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-        group_by_col (str): Column defining the cohort (e.g., country, sales person)
-        value_col (str): Column to analyze for anomalies
-        threshold (float): Z-score threshold for flagging anomalies
-
-    Returns:
-        pandas.DataFrame: DataFrame with cohort anomaly flags
-    """
-    # Create a copy to avoid modifying the original
-    result_df = df.copy()
-
-    # Initialize anomaly columns
-    result_df['Cohort_Anomaly'] = False
-    result_df['Cohort_Zscore'] = np.nan
-    result_df['Cohort_Deviation'] = np.nan
-
-    # Process each snapshot separately
-    for snapshot_date, snapshot_df in result_df.groupby(snapshot_date_col):
-        # Process each cohort within the snapshot
-        for group_value, group_df in snapshot_df.groupby(group_by_col):
-            # Need enough data points for meaningful analysis
-            if len(group_df) < 5:
-                continue
-
-            # Calculate cohort statistics
-            cohort_mean = group_df[value_col].mean()
-            cohort_std = group_df[value_col].std()
-
-            if cohort_std > 0:  # Avoid division by zero
-                # Calculate z-scores within cohort
-                z_scores = np.abs((group_df[value_col] - cohort_mean) / cohort_std)
-
-                # Flag anomalies
-                anomaly_flags = z_scores > threshold
-
-                # Update the main dataframe
-                result_df.loc[group_df.index, 'Cohort_Anomaly'] = anomaly_flags
-                result_df.loc[group_df.index, 'Cohort_Zscore'] = z_scores
-                result_df.loc[group_df.index, 'Cohort_Deviation'] = group_df[value_col] - cohort_mean
-
-    return result_df
-
-
-def identify_seasonal_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                               value_col='Balance Outstanding', expected_seasonality=12,
-                               threshold=2.0):
-    """
-    Identify vendors with anomalous behavior compared to their seasonal pattern.
-
-    Args:
-        df (pandas.DataFrame): Prepared vendor aging data
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-        value_col (str): Column to analyze for seasonal anomalies
-        expected_seasonality (int): Expected seasonality period (12 for annual)
-        threshold (float): Threshold for flagging seasonal anomalies
-
-    Returns:
-        pandas.DataFrame: DataFrame with seasonal anomaly flags
-    """
-    # Create a copy to avoid modifying the original
-    result_df = df.copy()
-
-    # Add seasonal anomaly columns
-    result_df['Seasonal_Anomaly'] = False
-    result_df['Seasonal_Deviation'] = np.nan
-
-    # Process each vendor with enough data
-    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
-        # Need enough data for seasonal analysis
-        if len(vendor_df) < expected_seasonality * 2:
-            continue
-
-        # Sort by snapshot date
-        vendor_data = vendor_df.sort_values(snapshot_date_col)
-
-        # Extract the month for each snapshot
-        vendor_data['Month'] = pd.to_datetime(vendor_data[snapshot_date_col]).dt.month
-
-        # Calculate average value by month (seasonal pattern)
-        monthly_avg = vendor_data.groupby('Month')[value_col].mean()
-        monthly_std = vendor_data.groupby('Month')[value_col].std()
-
-        # Flag anomalies by comparing each snapshot to the monthly average
-        for idx, row in vendor_data.iterrows():
-            month = row['Month']
-            expected_value = monthly_avg[month]
-            month_std = monthly_std[month]
-
-            if month_std > 0:  # Avoid division by zero
-                deviation = abs(row[value_col] - expected_value) / month_std
-
-                # Flag as anomaly if deviation exceeds threshold
-                if deviation > threshold:
-                    result_df.loc[idx, 'Seasonal_Anomaly'] = True
-                    result_df.loc[idx, 'Seasonal_Deviation'] = deviation
-
-    return result_df
-
-
-def detect_payment_pattern_anomalies(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                                 payment_date_col='LP Date', payment_amount_col='Vendor LP Amount'):
-    """
-    Detect anomalies in vendor payment patterns across snapshots.
-
-    Args:
-        df (pandas.DataFrame): Prepared vendor aging data
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-        payment_date_col (str): Column containing last payment date
-        payment_amount_col (str): Column containing last payment amount
-
-    Returns:
-        pandas.DataFrame: DataFrame with payment pattern anomaly flags
-    """
-    # Create a copy to avoid modifying the original
-    result_df = df.copy()
-
-    # Ensure date columns are datetime
-    if payment_date_col in result_df.columns and not pd.api.types.is_datetime64_any_dtype(result_df[payment_date_col]):
-        result_df[payment_date_col] = pd.to_datetime(result_df[payment_date_col], errors='coerce')
-
-    if snapshot_date_col in result_df.columns and not pd.api.types.is_datetime64_any_dtype(result_df[snapshot_date_col]):
-        result_df[snapshot_date_col] = pd.to_datetime(result_df[snapshot_date_col], errors='coerce')
-
-    # Initialize anomaly columns
-    result_df['Payment_Pattern_Anomaly'] = False
-    result_df['Payment_Pattern_Reason'] = ""
-
-    # Process each vendor separately
-    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
-        # Need enough snapshots for payment pattern analysis
-        if len(vendor_df) < 3:
-            continue
-
-        # Sort by snapshot date
-        vendor_data = vendor_df.sort_values(snapshot_date_col)
-
-        # Track payment dates across snapshots
-        payment_dates = []
-        payment_amounts = []
-
-        for idx, row in vendor_data.iterrows():
-            payment_date = row[payment_date_col]
-            payment_amount = row[payment_amount_col]
-
-            # Check if this is a new payment date
-            if payment_date is not pd.NaT and (
-                len(payment_dates) == 0 or payment_date != payment_dates[-1]
-            ):
-                payment_dates.append(payment_date)
-                payment_amounts.append(payment_amount)
-
-        # Analyze payment patterns if we have multiple payments
-        if len(payment_dates) >= 3:
-            # Calculate intervals between payments
-            intervals = [(payment_dates[i] - payment_dates[i-1]).days for i in range(1, len(payment_dates))]
-            avg_interval = sum(intervals) / len(intervals)
-            std_interval = np.std(intervals) if len(intervals) > 1 else 0
-
-            # Calculate typical payment amount
-            avg_amount = sum(payment_amounts) / len(payment_amounts)
-            std_amount = np.std(payment_amounts) if len(payment_amounts) > 1 else 0
-
-            # Check for pattern anomalies in each snapshot
-            for idx, row in vendor_data.iterrows():
-                anomaly_reasons = []
-
-                # 1. Check for unusually long time since last payment
-                days_since_payment = (row[snapshot_date_col] - row[payment_date_col]).days if row[payment_date_col] is not pd.NaT else None
-
-                if days_since_payment is not None and days_since_payment > avg_interval + 2 * std_interval:
-                    anomaly_reasons.append(f"Unusual gap since last payment ({days_since_payment} days vs avg {avg_interval:.0f})")
-
-                # 2. Check for unusually small/large payment amount
-                if std_amount > 0 and abs(row[payment_amount_col] - avg_amount) > 2 * std_amount:
-                    direction = "small" if row[payment_amount_col] < avg_amount else "large"
-                    anomaly_reasons.append(f"Unusually {direction} payment amount (${row[payment_amount_col]:.2f} vs avg ${avg_amount:.2f})")
-
-                # Update the dataframe
-                if anomaly_reasons:
-                    result_df.loc[idx, 'Payment_Pattern_Anomaly'] = True
-                    result_df.loc[idx, 'Payment_Pattern_Reason'] = "; ".join(anomaly_reasons)
-
-    return result_df
-
-
-def combine_anomaly_detectors(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID'):
-    """
-    Combine multiple anomaly detection methods for a comprehensive view.
-
-    Args:
-        df (pandas.DataFrame): Prepared vendor aging data
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-
-    Returns:
-        pandas.DataFrame: DataFrame with combined anomaly results
-    """
-    # Create a copy to avoid modifying the original
-    result_df = df.copy()
-
-    # Apply each anomaly detection method
-    print("Detecting multivariate anomalies...")
-    multivariate_df = detect_multivariate_anomalies(result_df)
-
-    print("Detecting pattern anomalies...")
-    pattern_df = detect_pattern_anomalies(result_df)
-
-    print("Detecting velocity anomalies...")
-    velocity_df = detect_velocity_anomalies(result_df)
-
-    print("Detecting cohort anomalies...")
-    cohort_df = detect_cohort_anomalies(result_df)
-
-    # Combine results into a single dataframe
-    result_df['Multivariate_Anomaly'] = multivariate_df['Multivariate_Anomaly']
-    result_df['Multivariate_Score'] = multivariate_df['Anomaly_Score']
-    result_df['Multivariate_Reason'] = multivariate_df['Anomaly_Reason'] if 'Anomaly_Reason' in multivariate_df.columns else ""
-
-    result_df['Pattern_Anomaly'] = pattern_df['Pattern_Anomaly']
-    result_df['Pattern_Score'] = pattern_df['Pattern_Zscore']
-
-    result_df['Velocity_Anomaly'] = velocity_df['Velocity_Anomaly']
-    result_df['Velocity_Score'] = velocity_df['Velocity_Anomaly_Score']
-    result_df['Velocity_Reason'] = velocity_df['Velocity_Anomaly_Reason']
-
-    result_df['Cohort_Anomaly'] = cohort_df['Cohort_Anomaly']
-    result_df['Cohort_Score'] = cohort_df['Cohort_Zscore']
-
-    # Create a combined anomaly flag and score
-    result_df['Any_Anomaly'] = (
-        result_df['Multivariate_Anomaly'] |
-        result_df['Pattern_Anomaly'] |
-        result_df['Velocity_Anomaly'] |
-        result_df['Cohort_Anomaly']
-    )
-
-    # Create a combined anomaly score (average of available scores)
-    score_columns = [col for col in ['Multivariate_Score', 'Pattern_Score', 'Velocity_Score', 'Cohort_Score']
-                    if col in result_df.columns]
-
-    if score_columns:
-        result_df['Combined_Anomaly_Score'] = result_df[score_columns].mean(axis=1)
-    else:
-        result_df['Combined_Anomaly_Score'] = np.nan
-
-    # Create a comprehensive anomaly reason
-    anomaly_reasons = []
-    for idx, row in result_df.iterrows():
-        reasons = []
-
-        if row.get('Multivariate_Anomaly') and 'Multivariate_Reason' in row and row['Multivariate_Reason']:
-            reasons.append(f"Multivariate: {row['Multivariate_Reason']}")
-
-        if row.get('Pattern_Anomaly'):
-            reasons.append("Unusual pattern change")
-
-        if row.get('Velocity_Anomaly') and 'Velocity_Reason' in row and row['Velocity_Reason']:
-            reasons.append(f"Velocity: {row['Velocity_Reason']}")
-
-        if row.get('Cohort_Anomaly'):
-            if 'Cohort_Deviation' in row:
-                direction = "higher" if row['Cohort_Deviation'] > 0 else "lower"
-                reasons.append(f"Differs from cohort: {direction} than peers")
-            else:
-                reasons.append("Differs from cohort")
-
-        anomaly_reasons.append("; ".join(reasons))
-
-    result_df['Anomaly_Details'] = anomaly_reasons
-
-    return result_df
-
-
-def segment_vendors_by_anomaly_patterns(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                                     n_clusters=4):
-    """
-    Segment vendors based on their anomaly patterns over time.
-
-    Args:
-        df (pandas.DataFrame): Dataframe with anomaly detection results
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-        n_clusters (int): Number of clusters to create
-
-    Returns:
-        pandas.DataFrame: DataFrame with anomaly pattern segments
-    """
-    # Create a copy to avoid modifying the original
-    result_df = df.copy()
-
-    # Calculate anomaly frequency for each vendor across snapshots
-    vendor_anomaly_stats = []
-
-    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
-        # Count snapshots with different types of anomalies
-        total_snapshots = len(vendor_df)
-
-        if total_snapshots == 0:
-            continue
-
-        multivariate_count = sum(vendor_df.get('Multivariate_Anomaly', 0))
-        pattern_count = sum(vendor_df.get('Pattern_Anomaly', 0))
-        velocity_count = sum(vendor_df.get('Velocity_Anomaly', 0))
-        cohort_count = sum(vendor_df.get('Cohort_Anomaly', 0))
-        any_count = sum(vendor_df.get('Any_Anomaly', 0))
-
-        # Calculate frequencies
-        vendor_stats = {
-            'Vendor_ID': vendor_id,
-            'Total_Snapshots': total_snapshots,
-            'Multivariate_Frequency': multivariate_count / total_snapshots,
-            'Pattern_Frequency': pattern_count / total_snapshots,
-            'Velocity_Frequency': velocity_count / total_snapshots,
-            'Cohort_Frequency': cohort_count / total_snapshots,
-            'Any_Anomaly_Frequency': any_count / total_snapshots,
-            'Max_Anomaly_Score': vendor_df.get('Combined_Anomaly_Score', 0).max() if 'Combined_Anomaly_Score' in vendor_df else 0
-        }
-
-        vendor_anomaly_stats.append(vendor_stats)
-
-    # Create dataframe with vendor anomaly statistics
-    anomaly_stats_df = pd.DataFrame(vendor_anomaly_stats)
-
-    # Apply clustering to segment vendors
-    if len(anomaly_stats_df) >= n_clusters:
-        # Features for clustering
-        features = [
-            'Multivariate_Frequency', 'Pattern_Frequency',
-            'Velocity_Frequency', 'Cohort_Frequency',
-            'Any_Anomaly_Frequency', 'Max_Anomaly_Score'
-        ]
-
-        # Prepare feature matrix
-        X = anomaly_stats_df[features].fillna(0)
-
-        # Normalize features
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-
-        # Apply K-means clustering
-        from sklearn.cluster import KMeans
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        clusters = kmeans.fit_predict(X_scaled)
-
-        # Add cluster assignments
-        anomaly_stats_df['Anomaly_Cluster'] = clusters
-
-        # Create descriptive labels
-        cluster_profiles = {}
-        for i in range(n_clusters):
-            cluster_data = anomaly_stats_df[anomaly_stats_df['Anomaly_Cluster'] == i]
-
-            # Determine key characteristics
-            avg_frequency = cluster_data['Any_Anomaly_Frequency'].mean()
-            max_score = cluster_data['Max_Anomaly_Score'].mean()
-
-            # Primary anomaly type
-            anomaly_types = ['Multivariate', 'Pattern', 'Velocity', 'Cohort']
-            type_frequencies = [
-                cluster_data[f'{t}_Frequency'].mean() for t in anomaly_types
-            ]
-            primary_type = anomaly_types[np.argmax(type_frequencies)]
-
-            # Create label
-            if avg_frequency > 0.7:
-                frequency_label = "Frequent"
-            elif avg_frequency > 0.3:
-                frequency_label = "Occasional"
-            else:
-                frequency_label = "Rare"
-
-            if max_score > 0.7:
-                severity_label = "Severe"
-            elif max_score > 0.4:
-                severity_label = "Moderate"
-            else:
-                severity_label = "Minor"
-
-            label = f"Cluster {i+1}: {frequency_label} {severity_label} Anomalies ({primary_type})"
-
-            cluster_profiles[i] = {
-                'label': label,
-                'size': len(cluster_data),
-                'avg_frequency': avg_frequency,
-                'avg_max_score': max_score,
-                'primary_type': primary_type
-            }
-
-        # Map clusters back to the main dataframe
-        vendor_cluster_map = anomaly_stats_df[['Vendor_ID', 'Anomaly_Cluster']].set_index('Vendor_ID')
-
-        # Add cluster and label to each snapshot
-        result_df['Anomaly_Cluster'] = result_df[vendor_id_col].map(vendor_cluster_map['Anomaly_Cluster'])
-        result_df['Anomaly_Cluster_Label'] = result_df['Anomaly_Cluster'].map({i: profile['label'] for i, profile in cluster_profiles.items()})
-
-        return result_df, cluster_profiles
-    else:
-        # Not enough vendors for clustering
-        return result_df, {}
-
-
-def detect_change_points(df, snapshot_date_col='Snapshot_Date', vendor_id_col='Vendor ID',
-                       value_col='Balance Outstanding', min_snapshots=8):
-    """
-    Detect points of significant change in vendor time series.
-
-    Args:
-        df (pandas.DataFrame): Prepared vendor aging data
-        snapshot_date_col (str): Column containing snapshot date
-        vendor_id_col (str): Column containing vendor identifier
-        value_col (str): Column to analyze for change points
-        min_snapshots (int): Minimum number of snapshots required for analysis
-
-    Returns:
-        dict: Change points by vendor
-    """
-    try:
-        # Try to import the ruptures package for change point detection
-        import ruptures as rpt
-        has_ruptures = True
-    except ImportError:
-        print("ruptures package not available - using simplified change point detection")
-        has_ruptures = False
-
-    # Create a copy to avoid modifying the original
-    result_df = df.copy()
-
-    # Results dictionary
-    change_points = {}
-
-    # Process each vendor with enough data
-    for vendor_id, vendor_df in result_df.groupby(vendor_id_col):
-        # Sort by snapshot date
-        vendor_data = vendor_df.sort_values(snapshot_date_col)
-
-        # Skip if not enough data points
-        if len(vendor_data) < min_snapshots:
-            continue
-
-        # Extract the time series
-        values = vendor_data[value_col].values
-        dates = vendor_data[snapshot_date_col].values
-
-        if has_ruptures:
-            # Use ruptures for optimal change point detection
-            algo = rpt.Pelt(model="rbf").fit(values.reshape(-1, 1))
-            result = algo.predict(pen=2)  # Penalty parameter
-
-            # Convert indices to dates
-            change_point_dates = [dates[idx-1] for idx in result[:-1]]  # Exclude the last point (end of series)
-
-            change_points[vendor_id] = {
-                'dates': [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d) for d in change_point_dates],
-                'indices': result[:-1],
-                'values_before': [values[idx-2] for idx in result[:-1]],
-                'values_after': [values[idx] for idx in result[:-1]]
-            }
-        else:
-            # Simplified detection based on standard deviation
-            diffs = np.abs(np.diff(values))
-            threshold = np.mean(diffs) + 2 * np.std(diffs)
-
-            # Find points exceeding threshold
-            cp_indices = np.where(diffs > threshold)[0]
-            cp_indices = [idx + 1 for idx in cp_indices]  # Convert to 1-based indices
-
-            # Convert indices to dates
-            change_point_dates = [dates[idx] for idx in cp_indices if idx < len(dates)]
-
-            change_points[vendor_id] = {
-                'dates': [d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d) for d in change_point_dates],
-                'indices': cp_indices,
-                'values_before': [values[idx-1] for idx in cp_indices if idx < len(values)],
-                'values_after': [values[idx] for idx in cp_indices if idx < len(values)]
-            }
-
-    return change_points
-
-
-
-def export_anomaly_detection_results(df, output_dir, vendor_id_col='Vendor ID',
-                                     snapshot_date_col='Snapshot_Date', file_format='both'):
-    """
-    Export the results of anomaly detection analysis to CSV and/or JSON files.
-
-    Args:
-        df (pandas.DataFrame): DataFrame containing anomaly detection results
-        output_dir (str): Directory to save output files
-        vendor_id_col (str): Column containing vendor identifier
-        snapshot_date_col (str): Column containing snapshot date
-        file_format (str): Export format ('csv', 'json', or 'both')
-
-    Returns:
-        dict: Paths to exported files
-    """
-    # Create output directory if it doesn't exist
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    # Current date for filenames
-    today = datetime.now().strftime('%Y-%m-%d')
-
-    # Get the latest snapshot date
-    latest_snapshot_date = df[snapshot_date_col].max()
-    latest_snapshot_str = latest_snapshot_date.strftime('%Y-%m-%d') if hasattr(latest_snapshot_date, 'strftime') else str(latest_snapshot_date)
-
-    # Filter to the latest snapshot for current anomalies
-    latest_df = df[df[snapshot_date_col] == latest_snapshot_date]
-
-    # Output files
-    output_files = {}
-
-    # ===== 1. Export summary statistics =====
-    summary_stats = {
-        'generated_date': today,
-        'snapshot_date': latest_snapshot_str,
-        'total_vendors': latest_df[vendor_id_col].nunique(),
-        'total_records': len(latest_df),
-        'anomaly_counts': {
-            'multivariate_anomalies': int(latest_df['Multivariate_Anomaly'].sum()) if 'Multivariate_Anomaly' in latest_df.columns else 0,
-            'pattern_anomalies': int(latest_df['Pattern_Anomaly'].sum()) if 'Pattern_Anomaly' in latest_df.columns else 0,
-            'velocity_anomalies': int(latest_df['Velocity_Anomaly'].sum()) if 'Velocity_Anomaly' in latest_df.columns else 0,
-            'cohort_anomalies': int(latest_df['Cohort_Anomaly'].sum()) if 'Cohort_Anomaly' in latest_df.columns else 0,
-            'payment_pattern_anomalies': int(latest_df['Payment_Pattern_Anomaly'].sum()) if 'Payment_Pattern_Anomaly' in latest_df.columns else 0,
-            'seasonal_anomalies': int(latest_df['Seasonal_Anomaly'].sum()) if 'Seasonal_Anomaly' in latest_df.columns else 0,
-            'any_anomaly': int(latest_df['Any_Anomaly'].sum()) if 'Any_Anomaly' in latest_df.columns else 0
-        }
-    }
-
-    # Add percentage of vendors with anomalies
-    total_vendors = latest_df[vendor_id_col].nunique()
-    if total_vendors > 0:
-        summary_stats['anomaly_percentages'] = {
-            key: (count / total_vendors * 100)
-            for key, count in summary_stats['anomaly_counts'].items()
-        }
-
-    # Export summary statistics
-    summary_file = os.path.join(output_dir, f'anomaly_summary_{today}.json')
-    with open(summary_file, 'w') as f:
-        json.dump(summary_stats, f, indent=2)
-
-    output_files['summary'] = summary_file
-
-    # ===== 2. Export detailed anomaly data =====
-    # Create a simplified version with key anomaly information
-    anomaly_columns = [
-        vendor_id_col, 'Vendor', 'Balance Outstanding', 'Aging_Beyond_90',
-        'Multivariate_Anomaly', 'Multivariate_Score', 'Multivariate_Reason',
-        'Pattern_Anomaly', 'Pattern_Score', 'Pattern_Change',
-        'Velocity_Anomaly', 'Velocity_Score', 'Velocity_Reason',
-        'Cohort_Anomaly', 'Cohort_Score', 'Cohort_Deviation',
-        'Payment_Pattern_Anomaly', 'Payment_Pattern_Reason',
-        'Seasonal_Anomaly', 'Seasonal_Deviation',
-        'Any_Anomaly', 'Combined_Anomaly_Score', 'Anomaly_Details',
-        'Anomaly_Cluster', 'Anomaly_Cluster_Label'
-    ]
-
-    # Filter columns that exist in the dataframe
-    export_columns = [col for col in anomaly_columns if col in latest_df.columns]
-
-    # Add key financial and metadata columns if they exist
-    if 'SalesPerson_Name' in latest_df.columns:
-        export_columns.append('SalesPerson_Name')
-    if 'AccountManager_Name' in latest_df.columns:
-        export_columns.append('AccountManager_Name')
-    if 'country_name' in latest_df.columns:
-        export_columns.append('country_name')
-
-    # Create export dataframe with selected columns
-    export_df = latest_df[export_columns].copy()
-
-    # Export to CSV
-    if file_format in ['csv', 'both']:
-        csv_file = os.path.join(output_dir, f'vendor_anomalies_{today}.csv')
-        export_df.to_csv(csv_file, index=False)
-        output_files['csv'] = csv_file
-
-    # Export to JSON
-    if file_format in ['json', 'both']:
-        # Export all anomalies
-        all_anomalies_file = os.path.join(output_dir, f'vendor_anomalies_{today}.json')
-        export_df.to_json(all_anomalies_file, orient='records', indent=2)
-        output_files['json_all'] = all_anomalies_file
-
-        # Export only records with anomalies
-        anomaly_records = export_df[export_df['Any_Anomaly'] == True] if 'Any_Anomaly' in export_df.columns else pd.DataFrame()
-
-        if not anomaly_records.empty:
-            anomaly_only_file = os.path.join(output_dir, f'vendor_anomalies_only_{today}.json')
-            anomaly_records.to_json(anomaly_only_file, orient='records', indent=2)
-            output_files['json_anomalies'] = anomaly_only_file
-
-    # ===== 3. Export aggregated anomaly data for visualization =====
-
-    # 3.1 Anomalies by country
-    if 'country_name' in latest_df.columns:
-        country_anomalies = (
-            latest_df.groupby('country_name')
-            .agg({
-                vendor_id_col: 'nunique',
-                'Any_Anomaly': 'sum' if 'Any_Anomaly' in latest_df.columns else 'size',
-                'Combined_Anomaly_Score': 'mean' if 'Combined_Anomaly_Score' in latest_df.columns else 'size',
-                'Balance Outstanding': 'sum',
-                'Aging_Beyond_90': 'sum' if 'Aging_Beyond_90' in latest_df.columns else 'size'
-            })
-            .reset_index()
-            .rename(columns={vendor_id_col: 'vendor_count', 'Any_Anomaly': 'anomaly_count'})
-        )
-
-        if 'anomaly_count' in country_anomalies.columns and 'vendor_count' in country_anomalies.columns:
-            country_anomalies['anomaly_percentage'] = country_anomalies['anomaly_count'] / country_anomalies['vendor_count'] * 100
-
-        country_file = os.path.join(output_dir, f'country_anomalies_{today}.json')
-        country_anomalies.to_json(country_file, orient='records', indent=2)
-        output_files['country_anomalies'] = country_file
-
-    # 3.2 Anomalies by sales person
-    if 'SalesPerson_Name' in latest_df.columns:
-        sales_anomalies = (
-            latest_df.groupby('SalesPerson_Name')
-            .agg({
-                vendor_id_col: 'nunique',
-                'Any_Anomaly': 'sum' if 'Any_Anomaly' in latest_df.columns else 'size',
-                'Combined_Anomaly_Score': 'mean' if 'Combined_Anomaly_Score' in latest_df.columns else 'size',
-                'Balance Outstanding': 'sum',
-                'Aging_Beyond_90': 'sum' if 'Aging_Beyond_90' in latest_df.columns else 'size'
-            })
-            .reset_index()
-            .rename(columns={vendor_id_col: 'vendor_count', 'Any_Anomaly': 'anomaly_count'})
-            .sort_values('anomaly_count', ascending=False)
-        )
-
-        if 'anomaly_count' in sales_anomalies.columns and 'vendor_count' in sales_anomalies.columns:
-            sales_anomalies['anomaly_percentage'] = sales_anomalies['anomaly_count'] / sales_anomalies['vendor_count'] * 100
-
-        sales_file = os.path.join(output_dir, f'salesperson_anomalies_{today}.json')
-        sales_anomalies.to_json(sales_file, orient='records', indent=2)
-        output_files['sales_anomalies'] = sales_file
-
-    # 3.3 Anomalies by type
-    if 'Any_Anomaly' in latest_df.columns:
-        anomaly_columns = [
-            'Multivariate_Anomaly', 'Pattern_Anomaly', 'Velocity_Anomaly',
-            'Cohort_Anomaly', 'Payment_Pattern_Anomaly', 'Seasonal_Anomaly'
-        ]
-
-        anomaly_types = []
-        for col in anomaly_columns:
-            if col in latest_df.columns:
-                count = int(latest_df[col].sum())
-                pct = count / len(latest_df) * 100
-                anomaly_types.append({
-                    'type': col.replace('_Anomaly', ''),
-                    'count': count,
-                    'percentage': pct
-                })
-
-        types_file = os.path.join(output_dir, f'anomaly_types_{today}.json')
-        with open(types_file, 'w') as f:
-            json.dump(anomaly_types, f, indent=2)
-
-        output_files['anomaly_types'] = types_file
-
-    # 3.4 Export cluster profiles if available
-    if 'Anomaly_Cluster' in latest_df.columns:
-        clusters = latest_df['Anomaly_Cluster'].dropna().unique()
-
-        cluster_stats = []
-        for cluster in clusters:
-            cluster_df = latest_df[latest_df['Anomaly_Cluster'] == cluster]
-
-            if 'Anomaly_Cluster_Label' in cluster_df.columns:
-                label = cluster_df['Anomaly_Cluster_Label'].iloc[0]
-            else:
-                label = f"Cluster {int(cluster)}"
-
-            stats = {
-                'cluster': int(cluster),
-                'label': label,
-                'vendor_count': cluster_df[vendor_id_col].nunique(),
-                'record_count': len(cluster_df),
-                'avg_anomaly_score': float(cluster_df['Combined_Anomaly_Score'].mean()) if 'Combined_Anomaly_Score' in cluster_df.columns else None,
-                'total_balance': float(cluster_df['Balance Outstanding'].sum()),
-                'total_aging_beyond_90': float(cluster_df['Aging_Beyond_90'].sum()) if 'Aging_Beyond_90' in cluster_df.columns else None
-            }
-
-            cluster_stats.append(stats)
-
-        cluster_file = os.path.join(output_dir, f'anomaly_clusters_{today}.json')
-        with open(cluster_file, 'w') as f:
-            json.dump(cluster_stats, f, indent=2)
-
-        output_files['cluster_stats'] = cluster_file
-
-    # ===== 4. Export trend analysis =====
-    # Create a file showing how anomalies have evolved over time
-
-    # Group by snapshot date
-    snapshot_trends = (
-        df.groupby(snapshot_date_col)
-        .agg({
-            vendor_id_col: 'nunique',
-            'Any_Anomaly': 'sum' if 'Any_Anomaly' in df.columns else 'size',
-            'Combined_Anomaly_Score': 'mean' if 'Combined_Anomaly_Score' in df.columns else 'size',
-            'Balance Outstanding': 'sum',
-            'Aging_Beyond_90': 'sum' if 'Aging_Beyond_90' in df.columns else 'size'
-        })
-        .reset_index()
-    )
-
-    # Convert snapshot date to string for JSON serialization
-    if hasattr(snapshot_trends[snapshot_date_col].iloc[0], 'strftime'):
-        snapshot_trends[snapshot_date_col] = snapshot_trends[snapshot_date_col].dt.strftime('%Y-%m-%d')
-    else:
-        snapshot_trends[snapshot_date_col] = snapshot_trends[snapshot_date_col].astype(str)
-
-    # Calculate anomaly rate if possible
-    if 'Any_Anomaly' in snapshot_trends.columns and vendor_id_col in snapshot_trends.columns:
-        snapshot_trends['anomaly_rate'] = snapshot_trends['Any_Anomaly'] / snapshot_trends[vendor_id_col] * 100
-
-    trends_file = os.path.join(output_dir, f'anomaly_trends_{today}.json')
-    snapshot_trends.to_json(trends_file, orient='records', indent=2)
-    output_files['trends'] = trends_file
-
-    # ===== 5. Export top anomalies for dashboard =====
-    # Create a simplified list of top vendors with anomalies for dashboard display
-
-    if 'Any_Anomaly' in latest_df.columns:
-        # Get vendors with any anomaly
-        anomaly_vendors = latest_df[latest_df['Any_Anomaly'] == True]
-
-        if not anomaly_vendors.empty and 'Combined_Anomaly_Score' in anomaly_vendors.columns:
-            # Sort by anomaly score
-            top_anomalies = (
-                anomaly_vendors
-                .sort_values('Combined_Anomaly_Score', ascending=False)
-                .head(20)
-            )
-
-            # Create simplified records for dashboard
-            dashboard_records = []
-            for _, vendor in top_anomalies.iterrows():
-                record = {
-                    'vendor_id': int(vendor[vendor_id_col]) if pd.notna(vendor[vendor_id_col]) else None,
-                    'vendor_name': vendor['Vendor'] if 'Vendor' in vendor else f"Vendor {vendor[vendor_id_col]}",
-                    'balance': float(vendor['Balance Outstanding']),
-                    'aging_beyond_90': float(vendor['Aging_Beyond_90']) if 'Aging_Beyond_90' in vendor else None,
-                    'anomaly_score': float(vendor['Combined_Anomaly_Score']),
-                    'anomaly_details': vendor['Anomaly_Details'] if 'Anomaly_Details' in vendor else None,
-                    'anomaly_types': []
-                }
-
-                # Add anomaly types
-                for col in ['Multivariate_Anomaly', 'Pattern_Anomaly', 'Velocity_Anomaly',
-                           'Cohort_Anomaly', 'Payment_Pattern_Anomaly', 'Seasonal_Anomaly']:
-                    if col in vendor and vendor[col]:
-                        record['anomaly_types'].append(col.replace('_Anomaly', ''))
-
-                dashboard_records.append(record)
-
-            dashboard_file = os.path.join(output_dir, f'dashboard_anomalies_{today}.json')
-            with open(dashboard_file, 'w') as f:
-                json.dump(dashboard_records, f, indent=2)
-
-            output_files['dashboard'] = dashboard_file
-
-    print(f"Anomaly detection results exported to {output_dir}")
-    return output_files
-
-
-class VendorAgingSnapshotAnalytics:
-    """
-    Analytics engine for vendor aging data that properly handles multiple snapshots.
-    """
-
-    def __init__(self, data_path, output_dir):
-        """
-        Initialize the analytics engine.
-
-        Args:
-            data_path: Path to the vendor aging CSV file
-            output_dir: Directory to save output JSON/CSV files
-        """
-        self.data_path = data_path
-        self.output_dir = output_dir
-        self.df = None
-        self.prepared_df = None
-        self.today = datetime.now().strftime('%Y-%m-%d')
-
-        # Create output directory if it doesn't exist
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    def load_data(self):
-        """Load the vendor aging data and prepare it for time series analysis"""
-        # Load raw data
-        self.df = pd.read_csv(self.data_path)
-
-        # Prepare data for time series analysis
-        self.prepared_df = prepare_time_series_data(self.df)
-
-        # Calculate key metrics
-        self.prepared_df = calculate_aging_metrics_over_time(self.prepared_df)
-        self.prepared_df = calculate_aging_trends(self.prepared_df)
-        self.prepared_df = vendor_payment_history_analysis(self.prepared_df)
-
-        return self
-
-    def generate_descriptive_analytics(self):
-        """
-        Generate descriptive analytics that properly account for snapshots
-        """
-        if self.prepared_df is None:
-            self.load_data()
-
-        results = {}
-
-        # Get the latest snapshot date
-        latest_snapshot_date = self.prepared_df['Snapshot_Date'].max()
-
-        # Filter to latest snapshot for current metrics
-        latest_df = self.prepared_df[self.prepared_df['Snapshot_Date'] == latest_snapshot_date]
-
-        # Get the previous snapshot (1 month ago) for comparison
-        snapshot_dates = sorted(self.prepared_df['Snapshot_Date'].unique())
-        if len(snapshot_dates) > 1:
-            previous_snapshot_date = snapshot_dates[-2]
-            previous_df = self.prepared_df[self.prepared_df['Snapshot_Date'] == previous_snapshot_date]
-        else:
-            previous_df = latest_df  # Use the same if no previous snapshot
-
-        # 1.1 Daily Aging Summary (for latest snapshot)
-        aging_summary = {
-            'snapshot_date': latest_snapshot_date.strftime('%Y-%m-%d') if isinstance(latest_snapshot_date, pd.Timestamp) else str(latest_snapshot_date),
-            'total_balance': latest_df['Balance Outstanding'].sum(),
-            'total_vendors': latest_df['Vendor'].nunique(),
-            'aging_distribution': {
-                'Future': latest_df['Future_Aging'].sum(),
-                '0-30': latest_df['Aging_0_30'].sum(),
-                '31-60': latest_df['Aging_31_60'].sum(),
-                '61-90': latest_df['Aging_61_90'].sum(),
-                '91-120': latest_df['Aging_91_120'].sum(),
-                '121-180': latest_df['Aging_121_180'].sum(),
-                '181-360': latest_df['Aging_181_360'].sum(),
-                '361+': latest_df['Above_361_Aging'].sum()
-            },
-            'total_aged_beyond_90': latest_df['Aging_Beyond_90'].sum(),
-            'change_from_previous': {
-                'total_balance': latest_df['Balance Outstanding'].sum() - previous_df['Balance Outstanding'].sum(),
-                'total_aged_beyond_90': latest_df['Aging_Beyond_90'].sum() - previous_df['Aging_Beyond_90'].sum()
-            },
-            'run_date': self.today
-        }
-        results['aging_summary'] = aging_summary
-
-        # 1.2 Vendor Risk Scorecard (based on latest snapshot)
-        # Calculate collection priority score
-        latest_df = calculate_collection_priority_score(latest_df, latest_snapshot_only=True)
-
-        # Identify high risk vendors
-        high_risk_vendors = (
-            latest_df[latest_df['Collection_Priority'] == 'Critical']
-            .sort_values('Collection_Priority_Score', ascending=False)
-            .head(50)[
-                ['Vendor', 'Vendor ID', 'Balance Outstanding', 'Aging_Beyond_90',
-                 'Collection_Priority_Score', 'Collection_Priority']
-            ]
-            .to_dict('records')
-        )
-        results['high_risk_vendors'] = high_risk_vendors
-
-        # 1.3 Country Performance (latest snapshot)
+        
+        aging_distribution = {col: latest_data[col].sum() for col in aging_cols}
+        aging_distribution_pct = {col: value / total_balance * 100 for col, value in aging_distribution.items()}
+        
+        # Calculate country performance
         country_performance = (
-            latest_df.groupby('country_name')
+            latest_data.groupby('country_name')
             .agg({
                 'Balance Outstanding': 'sum',
                 'Aging_Beyond_90': 'sum',
                 'Vendor ID': 'nunique'
             })
-            .reset_index()
             .rename(columns={'Vendor ID': 'vendor_count'})
-            .to_dict('records')
-        )
-        results['country_performance'] = country_performance
-
-        # 1.4 Sales Team Performance (latest snapshot)
-        sales_performance = (
-            latest_df.groupby(['SalesPerson_Name', 'AccountManager_Name'])
-            .agg({
-                'Balance Outstanding': 'sum',
-                'Aging_Beyond_90': 'sum',
-                'Vendor ID': 'nunique',
-                'Collection_Priority_Score': 'mean'
-            })
-            .reset_index()
-            .rename(columns={'Vendor ID': 'vendor_count'})
-            .sort_values('Collection_Priority_Score', ascending=False)
-            .to_dict('records')
-        )
-        results['sales_performance'] = sales_performance
-
-        # Save outputs
-        with open(f"{self.output_dir}/descriptive_analytics_{self.today}.json", 'w') as f:
-            json.dump(results, f, indent=2)
-
-        return results
-
-    def generate_diagnostic_analytics(self):
-        """
-        Generate diagnostic analytics that identify anomalies and patterns across snapshots
-        """
-        if self.prepared_df is None:
-            self.load_data()
-
-        results = {}
-
-        # 2.1 Anomaly Detection
-        anomaly_df = detect_time_based_anomalies(self.prepared_df)
-
-        # Get the most recent anomalies
-        latest_snapshot_date = self.prepared_df['Snapshot_Date'].max()
-        latest_anomalies = anomaly_df[
-            (anomaly_df['Snapshot_Date'] == latest_snapshot_date) &
-            (anomaly_df['Time_Anomaly'])
-        ]
-
-        anomalies = (
-            latest_anomalies[
-                ['Vendor', 'Vendor ID', 'Balance Outstanding', 'Aging_Beyond_90',
-                 'Balance_MoM_Change', 'Aging_Beyond_90_MoM_Change', 'Anomaly_Details']
-            ]
-            .sort_values('Aging_Beyond_90', ascending=False)
-            .head(30)
-            .to_dict('records')
-        )
-
-        results['anomalies'] = anomalies
-
-        # 2.2 Root Cause Analysis
-        # Only use the latest snapshot for each vendor
-        latest_df = (
-            self.prepared_df
-            .sort_values('Snapshot_Date')
-            .groupby('Vendor ID')
-            .last()
             .reset_index()
         )
-
-        root_causes = identify_root_causes(latest_df)
-        results['root_cause_factors'] = root_causes.get('key_factors', [])
-
-        # 2.3 Vendor Cohort Analysis
-        cohort_df, cohort_profiles = create_vendor_cohorts(self.prepared_df)
-
-        # Get latest snapshot cohort distributions
-        latest_cohort_df = (
-            cohort_df[cohort_df['Snapshot_Date'] == latest_snapshot_date]
-            .groupby('Cohort_Label')
-            .agg({
-                'Vendor ID': 'nunique',
-                'Balance Outstanding': 'sum',
-                'Aging_Beyond_90': 'sum',
-                'Pct_Aging_Beyond_90': 'mean'
-            })
-            .reset_index()
-            .rename(columns={'Vendor ID': 'vendor_count'})
-        )
-
-        results['cohort_analysis'] = {
-            'cohort_profiles': {k: v for k, v in cohort_profiles.items()},
-            'cohort_distribution': latest_cohort_df.to_dict('records')
+        
+        # Store results
+        results = {
+            'snapshot_date': latest_date.strftime('%Y-%m-%d') if isinstance(latest_date, pd.Timestamp) else str(latest_date),
+            'total_balance': float(total_balance),
+            'total_aging_beyond_90': float(total_aging_beyond_90),
+            'pct_aging_beyond_90': float(total_aging_beyond_90 / total_balance * 100),
+            'aging_distribution': aging_distribution,
+            'aging_distribution_pct': aging_distribution_pct,
+            'country_performance': country_performance.to_dict('records'),
+            'run_date': self.today
         }
-
-        # 2.4 Snapshot Comparison (latest vs. previous month)
-        snapshot_dates = sorted(self.prepared_df['Snapshot_Date'].unique())
-        if len(snapshot_dates) > 1:
-            comparison = snapshot_comparison_analysis(
-                self.prepared_df,
-                base_date=snapshot_dates[-2],  # Previous month
-                compare_date=snapshot_dates[-1]  # Latest month
-            )
-
-            # Calculate overall changes
-            overall_changes = {
-                'balance_change': comparison['Balance Outstanding_Change'].sum(),
-                'balance_pct_change': (
-                    comparison['Balance Outstanding_Change'].sum() /
-                    comparison['Balance Outstanding_Base'].abs().sum() * 100
-                ),
-                'aging_beyond_90_change': comparison['Aging_Beyond_90_Change'].sum(),
-                'aging_beyond_90_pct_change': (
-                    comparison['Aging_Beyond_90_Change'].sum() /
-                    comparison['Aging_Beyond_90_Base'].abs().sum() * 100
-                ),
-                'improved_vendors': sum(comparison['Aging_Beyond_90_Direction'] == 'Decreased'),
-                'worsened_vendors': sum(comparison['Aging_Beyond_90_Direction'] == 'Increased'),
-                'unchanged_vendors': sum(comparison['Aging_Beyond_90_Direction'] == 'Unchanged')
-            }
-
-            results['snapshot_comparison'] = {
-                'base_date': snapshot_dates[-2].strftime('%Y-%m-%d') if isinstance(snapshot_dates[-2], pd.Timestamp) else str(snapshot_dates[-2]),
-                'compare_date': snapshot_dates[-1].strftime('%Y-%m-%d') if isinstance(snapshot_dates[-1], pd.Timestamp) else str(snapshot_dates[-1]),
-                'overall_changes': overall_changes,
-                'top_improved': comparison[comparison['Aging_Beyond_90_Direction'] == 'Decreased']
-                    .sort_values('Aging_Beyond_90_Change')
-                    .head(10)[['Vendor ID', 'Balance Outstanding_Change', 'Aging_Beyond_90_Change', 'Aging_Beyond_90_Pct_Change']]
-                    .to_dict('records'),
-                'top_worsened': comparison[comparison['Aging_Beyond_90_Direction'] == 'Increased']
-                    .sort_values('Aging_Beyond_90_Change', ascending=False)
-                    .head(10)[['Vendor ID', 'Balance Outstanding_Change', 'Aging_Beyond_90_Change', 'Aging_Beyond_90_Pct_Change']]
-                    .to_dict('records')
-            }
-
-        # Save outputs
-        with open(f"{self.output_dir}/diagnostic_analytics_{self.today}.json", 'w') as f:
+        
+        # Save to file
+        with open(f"{self.output_dir}/descriptive_analytics.json", 'w') as f:
             json.dump(results, f, indent=2)
-
+        
+        # Create visualization
+        self._generate_descriptive_visualizations(latest_date, latest_data, aging_cols, country_performance)
+        
         return results
-
-    def generate_prescriptive_analytics(self):
+    
+    def _generate_descriptive_visualizations(self, latest_date, latest_data, aging_cols, country_performance):
         """
-        Generate prescriptive analytics to guide decision making
+        Generate visualizations for descriptive analytics.
+        
+        Args:
+            latest_date: Date of the latest snapshot
+            latest_data: DataFrame filtered to the latest snapshot
+            aging_cols: List of aging bucket columns
+            country_performance: DataFrame with country performance metrics
         """
-        if self.prepared_df is None:
-            self.load_data()
-
-        results = {}
-
+        plt.figure(figsize=(14, 10))
+        
+        # Plot 1: Aging Bucket Distribution
+        plt.subplot(2, 2, 1)
+        aging_labels = ['Future', '0-30', '31-60', '61-90', '91-120', '121-180', '181-360', '361+']
+        aging_values = [latest_data[col].sum() for col in aging_cols]
+        plt.pie(aging_values, labels=aging_labels, autopct='%1.1f%%', startangle=90,
+               colors=sns.color_palette("YlOrRd", len(aging_cols)))
+        plt.axis('equal')
+        plt.title(f'Aging Distribution as of {latest_date.strftime("%Y-%m-%d")}')
+        
+        # Plot 2: Top Countries by Aging Beyond 90
+        plt.subplot(2, 2, 2)
+        country_perf_sorted = country_performance.sort_values('Aging_Beyond_90', ascending=False).head(5)
+        country_perf_sorted.plot(kind='bar', x='country_name', y='Aging_Beyond_90', ax=plt.gca(), color='coral')
+        plt.title('Top 5 Countries by Aging Beyond 90')
+        plt.xlabel('Country')
+        plt.ylabel('Amount ($)')
+        plt.xticks(rotation=45, ha='right')
+        
+        # Plot 3: Aging Trend Over Time
+        plt.subplot(2, 2, 3)
+        aging_by_snapshot = self.payment_df.groupby('Snapshot_Date')[['Balance Outstanding', 'Aging_Beyond_90']].sum()
+        aging_by_snapshot.plot(ax=plt.gca())
+        plt.title('Balance and Aging Beyond 90 Over Time')
+        plt.xlabel('Snapshot Date')
+        plt.ylabel('Amount ($)')
+        plt.grid(True)
+        
+        # Plot 4: Aging by Trend Category
+        plt.subplot(2, 2, 4)
+        trend_counts = latest_data['Aging_Trend_Category'].value_counts().sort_index()
+        colors = ['green', 'lightgreen', 'gray', 'orange', 'red']
+        trend_counts.plot(kind='bar', color=colors)
+        plt.title('Vendors by Aging Trend Category')
+        plt.xlabel('Trend Category')
+        plt.ylabel('Number of Vendors')
+        plt.grid(axis='y')
+        plt.xticks(rotation=45, ha='right')
+        
+        plt.tight_layout()
+        plt.savefig(f"{self.output_dir}/descriptive_analytics.png", dpi=300)
+        plt.close()
+    
+    def run_diagnostic_analytics(self):
+        """
+        Generate diagnostic analytics to identify patterns, cohorts, and anomalies.
+        
+        Returns:
+            dict: Diagnostic analytics results
+        """
+        print("Running diagnostic analytics...")
+        
+        # Ensure data is prepared
+        if self.payment_df is None:
+            self.prepare_data()
+        
+        # Run cohort analysis
+        self.cohort_df, self.cohort_profiles = create_vendor_cohorts(self.payment_df)
+        
+        # Run anomaly detection
+        self.anomalies_df = detect_multivariate_anomalies(self.cohort_df)
+        
         # Get the latest snapshot date
-        latest_snapshot_date = self.prepared_df['Snapshot_Date'].max()
-
-        # Filter to latest snapshot for current recommendations
-        latest_df = self.prepared_df[self.prepared_df['Snapshot_Date'] == latest_snapshot_date]
-
-        # 3.1 Collection Priority Queue
-        # Calculate collection priority if not already done
-        if 'Collection_Priority_Score' not in latest_df.columns:
-            latest_df = calculate_collection_priority_score(latest_df, latest_snapshot_only=True)
-
-        collection_priorities = (
-            latest_df
-            .sort_values('Collection_Priority_Score', ascending=False)
-            .head(50)[
-                ['Vendor', 'Vendor ID', 'Balance Outstanding', 'Aging_Beyond_90',
-                 'Collection_Priority_Score', 'Collection_Priority',
-                 'SalesPerson_Name', 'AccountManager_Name']
-            ]
-            .to_dict('records')
-        )
-
-        results['collection_priorities'] = collection_priorities
-
-        # 3.2 Credit Risk Management Recommendations
-        # Identify vendors with concerning trends
-        credit_recommendations = []
-
-        # Check if we have at least two snapshots
-        snapshot_dates = sorted(self.prepared_df['Snapshot_Date'].unique())
-        if len(snapshot_dates) >= 2:
-            # Get vendors with worsening aging trends
-            trend_df = self.prepared_df[
-                (self.prepared_df['Snapshot_Date'] == latest_snapshot_date) &
-                (self.prepared_df['Aging_Beyond_90_Trend'] > 10)  # 10% or more increase in aging
-            ]
-
-            for _, vendor in (
-                trend_df.sort_values('Aging_Beyond_90_Trend', ascending=False)
-                .head(30)
-                .iterrows()
-            ):
-                action = "Reduce credit limit" if vendor['Pct_Aging_Beyond_90'] > 50 else "Review credit terms"
-                credit_recommendations.append({
-                    'vendor': vendor['Vendor'],
-                    'vendor_id': vendor['Vendor ID'],
-                    'current_balance': vendor['Balance Outstanding'],
-                    'aging_beyond_90': vendor['Aging_Beyond_90'],
-                    'aging_trend': vendor['Aging_Beyond_90_Trend'],
-                    'recommended_action': action,
-                    'urgency': 'High' if vendor['Aging_Beyond_90_Trend'] > 20 else 'Medium'
-                })
-
-        results['credit_recommendations'] = credit_recommendations
-
-        # 3.3 Cash Flow Forecasting
-        # Waterfall analysis for top vendors
-        top_vendor_ids = (
-            latest_df
-            .sort_values('Balance Outstanding', ascending=False)
-            .head(20)['Vendor ID']
-            .tolist()
-        )
-
-        waterfall_analysis = aging_waterfall_analysis(
-            self.prepared_df[self.prepared_df['Vendor ID'].isin(top_vendor_ids)]
-        )
-
-        # Summarize transitions for forecasting
-        aging_buckets = [
-            'Future_Aging', 'Aging_0_30', 'Aging_31_60', 'Aging_61_90',
-            'Aging_91_120', 'Aging_121_180', 'Aging_181_360', 'Above_361_Aging'
-        ]
-
-        # Simple forecast based on historical transitions
-        # (In a real implementation, you would use proper time series forecasting)
-        current_totals = {bucket: latest_df[bucket].sum() for bucket in aging_buckets}
-
-        # Calculate average transitions from waterfall analysis
-        # This is a very simplified approach
-        transition_rates = {}
-        for i in range(len(aging_buckets) - 1):
-            from_bucket = aging_buckets[i]
-            to_bucket = aging_buckets[i+1]
-            transition_key = f'{from_bucket}_to_{to_bucket}'
-
-            transition_sum = 0
-            transition_count = 0
-
-            for vendor_id, analysis in waterfall_analysis.items():
-                for transition in analysis.get('transitions', []):
-                    if transition_key in transition.get('implied_transitions', {}):
-                        transition_sum += transition['implied_transitions'][transition_key]
-                        transition_count += 1
-
-            if transition_count > 0:
-                transition_rates[transition_key] = transition_sum / transition_count
-            else:
-                transition_rates[transition_key] = 0
-
-        # Simple 30/60/90-day forecast
-        forecast_30d = current_totals.copy()
-        forecast_60d = current_totals.copy()
-        forecast_90d = current_totals.copy()
-
-        # Apply transitions to forecast
-        # (This is highly simplified - a real implementation would use proper forecasting methods)
-        for i in range(len(aging_buckets) - 1):
-            from_bucket = aging_buckets[i]
-            to_bucket = aging_buckets[i+1]
-            transition_key = f'{from_bucket}_to_{to_bucket}'
-
-            # For 30-day forecast
-            forecast_30d[to_bucket] += forecast_30d[from_bucket] * 0.7  # Assume 70% moves to next bucket
-            forecast_30d[from_bucket] *= 0.3  # 30% stays in current bucket
-
-            # For 60-day forecast (apply transition twice)
-            forecast_60d[to_bucket] += forecast_60d[from_bucket] * 0.7
-            forecast_60d[from_bucket] *= 0.3
-
-            # For 90-day forecast (apply transition three times)
-            forecast_90d[to_bucket] += forecast_90d[from_bucket] * 0.7
-            forecast_90d[from_bucket] *= 0.3
-
-        results['cash_flow_forecast'] = {
-            'current': current_totals,
-            'forecast_30d': forecast_30d,
-            'forecast_60d': forecast_60d,
-            'forecast_90d': forecast_90d,
-            'transition_rates': transition_rates
+        latest_date = self.anomalies_df['Snapshot_Date'].max()
+        latest_data = self.anomalies_df[self.anomalies_df['Snapshot_Date'] == latest_date]
+        
+        # Count anomalies
+        num_anomalies = latest_data['Multivariate_Anomaly'].sum()
+        pct_anomalies = num_anomalies / len(latest_data) * 100
+        
+        # Create results dictionary
+        results = {
+            'snapshot_date': latest_date.strftime('%Y-%m-%d') if isinstance(latest_date, pd.Timestamp) else str(latest_date),
+            'cohort_analysis': {
+                'num_cohorts': len(self.cohort_profiles),
+                'cohort_profiles': {str(k): v for k, v in self.cohort_profiles.items()}
+            },
+            'anomaly_detection': {
+                'num_anomalies': int(num_anomalies),
+                'pct_anomalies': float(pct_anomalies),
+                'top_anomalies': latest_data[latest_data['Multivariate_Anomaly']]
+                    .sort_values('Anomaly_Score', ascending=False)
+                    .head(10)[['Vendor ID', 'Vendor', 'Balance Outstanding', 'Aging_Beyond_90', 'Anomaly_Score', 'Anomaly_Reason']]
+                    .to_dict('records')
+            },
+            'run_date': self.today
         }
-
-        # 3.4 Relationship Management Actions
-        # Generate tailored recommendations based on vendor patterns
-        relationship_actions = []
-
-        # Use the collection priorities as a basis
-        for vendor in collection_priorities[:20]:
-            vendor_id = vendor['Vendor ID']
-            vendor_data = latest_df[latest_df['Vendor ID'] == vendor_id]
-
-            if not vendor_data.empty:
-                # Determine recommended action based on aging pattern
-                pct_aging_beyond_90 = (
-                    vendor_data['Aging_Beyond_90'].values[0] /
-                    vendor_data['Balance Outstanding'].abs().values[0]
-                ) if vendor_data['Balance Outstanding'].abs().values[0] > 0 else 0
-
-                days_since_payment = vendor_data['Days_Since_Payment'].values[0] if 'Days_Since_Payment' in vendor_data.columns else 0
-
-                if pct_aging_beyond_90 > 0.7 and days_since_payment > 90:
-                    action = "Immediate contact by account manager; escalate to management"
-                    frequency = "Weekly follow-up"
-                elif pct_aging_beyond_90 > 0.5:
-                    action = "Schedule payment plan meeting; discuss credit terms"
-                    frequency = "Bi-weekly follow-up"
-                elif pct_aging_beyond_90 > 0.3:
-                    action = "Contact to review outstanding invoices; request payment timeline"
-                    frequency = "Monthly follow-up"
-                else:
-                    action = "Routine relationship check-in; verify invoice status"
-                    frequency = "Quarterly review"
-
-                relationship_actions.append({
-                    'vendor': vendor['Vendor'],
-                    'vendor_id': vendor['Vendor ID'],
-                    'recommended_action': action,
-                    'contact_frequency': frequency,
-                    'assigned_to': vendor['AccountManager_Name'],
-                    'support_from': vendor['SalesPerson_Name'],
-                    'aging_beyond_90': vendor['Aging_Beyond_90'],
-                    'balance_outstanding': vendor['Balance Outstanding']
-                })
-
-        results['relationship_actions'] = relationship_actions
-
-        # Save outputs
-        with open(f"{self.output_dir}/prescriptive_analytics_{self.today}.json", 'w') as f:
+        
+        # Save to file
+        with open(f"{self.output_dir}/diagnostic_analytics.json", 'w') as f:
             json.dump(results, f, indent=2)
-
+        
+        # Generate visualizations
+        self._generate_cohort_visualization()
+        self._generate_anomaly_visualization(latest_date, latest_data)
+        
         return results
-
+    
+    def _generate_cohort_visualization(self):
+        """Generate cohort analysis visualization."""
+        plt.figure(figsize=(14, 8))
+        
+        # Get the latest snapshot
+        latest_date = self.cohort_df['Snapshot_Date'].max()
+        latest_cohort = self.cohort_df[self.cohort_df['Snapshot_Date'] == latest_date]
+        
+        # Plot cohorts in 2D space
+        scatter = plt.scatter(
+            latest_cohort['Pct_Aging_Beyond_90'], 
+            latest_cohort['Aging_Beyond_90_Trend'], 
+            c=latest_cohort['Cohort'], 
+            s=latest_cohort['Balance Outstanding'] / 1000,  # Size proportional to balance
+            alpha=0.6,
+            cmap='viridis'
+        )
+        
+        # Add cluster centers
+        for cohort_id, profile in self.cohort_profiles.items():
+            plt.scatter(
+                profile['avg_pct_aging_beyond_90'],
+                profile['avg_trend'],
+                s=300,
+                c=[cohort_id],
+                cmap='viridis',
+                marker='X',
+                edgecolors='black',
+                linewidth=2
+            )
+            plt.annotate(
+                f"Cohort {cohort_id+1}",
+                (profile['avg_pct_aging_beyond_90'], profile['avg_trend']),
+                textcoords="offset points",
+                xytext=(0, 10),
+                ha='center',
+                fontweight='bold'
+            )
+        
+        plt.colorbar(scatter, label='Cohort')
+        plt.title('Vendor Cohorts: % Aging Beyond 90 Days vs. Aging Trend')
+        plt.xlabel('Percentage of Aging Beyond 90 Days')
+        plt.ylabel('Aging Beyond 90 Days Trend (%)')
+        plt.axhline(y=0, color='red', linestyle='--', alpha=0.3)
+        plt.axvline(x=30, color='red', linestyle='--', alpha=0.3)
+        plt.grid(True)
+        plt.savefig(f"{self.output_dir}/cohort_analysis.png", dpi=300)
+        plt.close()
+    
+    def _generate_anomaly_visualization(self, latest_date, latest_data):
+        """Generate anomaly detection visualization."""
+        plt.figure(figsize=(14, 6))
+        
+        # Use two important features for visualization
+        x_feature = 'Balance Outstanding'
+        y_feature = 'Aging_Beyond_90'
+        
+        # Create scatter plot
+        plt.scatter(
+            latest_data[x_feature], 
+            latest_data[y_feature],
+            c=latest_data['Multivariate_Anomaly'].map({True: 'red', False: 'blue'}),
+            alpha=0.6,
+            s=100
+        )
+        
+        # Add labels for anomalies
+        for _, row in latest_data[latest_data['Multivariate_Anomaly']].iterrows():
+            plt.annotate(
+                f"Vendor {row['Vendor ID']}",
+                (row[x_feature], row[y_feature]),
+                textcoords="offset points",
+                xytext=(5, 5),
+                ha='left'
+            )
+        
+        plt.title(f'Multivariate Anomalies - {latest_date.strftime("%Y-%m-%d")}')
+        plt.xlabel(x_feature)
+        plt.ylabel(y_feature)
+        plt.legend(['Normal', 'Anomaly'])
+        plt.grid(True)
+        plt.savefig(f"{self.output_dir}/anomaly_detection.png", dpi=300)
+        plt.close()
+    
+    def run_prescriptive_analytics(self):
+        """
+        Generate prescriptive analytics with recommended actions.
+        
+        Returns:
+            dict: Prescriptive analytics results
+        """
+        print("Generating prescriptive recommendations...")
+        
+        # Ensure previous analyses are complete
+        if self.anomalies_df is None:
+            self.run_diagnostic_analytics()
+        
+        # Calculate collection priorities
+        self.priority_df = calculate_collection_priority_score(self.anomalies_df)
+        
+        # Create action recommendations
+        self.recommendations_df = create_action_recommendations(self.priority_df)
+        
+        # Get priority distribution
+        priority_counts = self.recommendations_df['Collection_Priority'].value_counts()
+        action_counts = self.recommendations_df['Recommended_Action'].value_counts()
+        
+        # Extract critical vendors
+        critical_vendors = self.recommendations_df[
+            self.recommendations_df['Collection_Priority'] == 'Critical'
+        ].sort_values('Collection_Priority_Score', ascending=False)
+        
+        # Create results dictionary
+        results = {
+            'priority_distribution': priority_counts.to_dict(),
+            'action_distribution': action_counts.to_dict(),
+            'critical_vendors': critical_vendors[
+                ['Vendor ID', 'Vendor', 'Balance Outstanding', 'Aging_Beyond_90', 
+                 'Aging_Ratio', 'Days_Since_Payment', 'Collection_Priority_Score', 
+                 'Recommended_Action', 'Action_Urgency']
+            ].head(20).to_dict('records'),
+            'run_date': self.today
+        }
+        
+        # Save to file
+        with open(f"{self.output_dir}/prescriptive_analytics.json", 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        # Generate visualization
+        self._generate_priority_visualization()
+        
+        # Save recommendations to CSV
+        self.recommendations_df.to_csv(f"{self.output_dir}/vendor_recommendations.csv", index=False)
+        
+        return results
+    
+    def _generate_priority_visualization(self):
+        """Generate priority distribution visualization."""
+        plt.figure(figsize=(14, 6))
+        
+        # Priority counts
+        priority_counts = self.recommendations_df['Collection_Priority'].value_counts().sort_index()
+        ax = priority_counts.plot(kind='bar', color=['green', 'yellow', 'orange', 'red'])
+        plt.title('Distribution of Collection Priorities')
+        plt.xlabel('Priority')
+        plt.ylabel('Number of Vendors')
+        plt.grid(axis='y')
+        
+        # Add count labels on bars
+        for i, v in enumerate(priority_counts):
+            ax.text(i, v + 5, str(v), ha='center')
+        
+        plt.savefig(f"{self.output_dir}/priority_distribution.png", dpi=300)
+        plt.close()
+    
     def run_all_analytics(self):
         """
-        Run all analytics processes and generate outputs
+        Run all analytics processes and generate comprehensive results.
+        
+        Returns:
+            dict: Combined analytics results
         """
-        self.load_data()
-        descriptive = self.generate_descriptive_analytics()
-        diagnostic = self.generate_diagnostic_analytics()
-        prescriptive = self.generate_prescriptive_analytics()
-
-        # Combine all results into a single comprehensive file
+        print("Running comprehensive vendor aging analysis...")
+        
+        # Start with data preparation
+        if self.df is None:
+            raise ValueError("No data loaded. Please call load_data() first.")
+        
+        self.prepare_data()
+        
+        # Run all analyses
+        descriptive = self.run_descriptive_analytics()
+        diagnostic = self.run_diagnostic_analytics()
+        prescriptive = self.run_prescriptive_analytics()
+        
+        # Create executive summary
+        latest_date = self.recommendations_df['Snapshot_Date'].max()
+        num_vendors = self.recommendations_df['Vendor ID'].nunique()
+        total_balance = self.recommendations_df['Balance Outstanding'].sum()
+        total_aging_beyond_90 = self.recommendations_df['Aging_Beyond_90'].sum()
+        
+        exec_summary = {
+            "report_date": self.today,
+            "data_as_of": latest_date.strftime("%Y-%m-%d") if isinstance(latest_date, pd.Timestamp) else str(latest_date),
+            "total_vendors": int(num_vendors),
+            "total_balance": float(total_balance),
+            "total_aging_beyond_90": float(total_aging_beyond_90),
+            "pct_aging_beyond_90": float(total_aging_beyond_90 / total_balance * 100),
+            "num_critical_priority": int(self.recommendations_df[self.recommendations_df['Collection_Priority'] == 'Critical'].shape[0]),
+            "critical_balance": float(self.recommendations_df[self.recommendations_df['Collection_Priority'] == 'Critical']['Balance Outstanding'].sum()),
+            "anomalies_detected": int(self.anomalies_df['Multivariate_Anomaly'].sum()),
+            "cohort_summary": [
+                {
+                    "cohort_id": cohort_id,
+                    "label": profile['label'],
+                    "size": profile['size'],
+                    "avg_pct_aging_beyond_90": float(profile['avg_pct_aging_beyond_90'])
+                }
+                for cohort_id, profile in self.cohort_profiles.items()
+            ],
+            "key_actions": {
+                action: int(count) for action, count in self.recommendations_df['Recommended_Action'].value_counts().items()
+            }
+        }
+        
+        # Save executive summary
+        with open(f"{self.output_dir}/executive_summary.json", 'w') as f:
+            json.dump(exec_summary, f, indent=2)
+        
+        # Combine all results
         all_results = {
+            'executive_summary': exec_summary,
             'descriptive': descriptive,
             'diagnostic': diagnostic,
-            'prescriptive': prescriptive,
-            'generated_at': self.today,
-            'snapshot_dates': [
-                d.strftime('%Y-%m-%d') if isinstance(d, pd.Timestamp) else str(d)
-                for d in sorted(self.prepared_df['Snapshot_Date'].unique())
-            ]
+            'prescriptive': prescriptive
         }
-
-        with open(f"{self.output_dir}/all_analytics_{self.today}.json", 'w') as f:
-            json.dump(all_results, f, indent=2)
-
+        
+        print(f"Analysis complete! All results saved to '{self.output_dir}' directory.")
         return all_results
